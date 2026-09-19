@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Nepali Voice AI</string>
+    <string name="tap_to_talk">Tap to talk</string>
+    <string name="listening">सुन्दैछ… (Listening…)</string>
+    <string name="thinking">सोच्दैछ… (Thinking…)</string>
+    <string name="speaking">बोल्दैछ… (Speaking…)</string>
+    <string name="press_to_stop">Press again to stop</string>
+</resources>

@@ -1,0 +1,8 @@
+{
+  "name": "Nepali Voice AI",
+  "description": "Real-time Nepali voice conversation AI with Gemini native voice and ultra-low latency.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
