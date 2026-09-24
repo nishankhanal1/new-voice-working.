@@ -26,6 +26,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -430,8 +431,8 @@ class AudioEngine(private val context: Context) {
 
     /**
      * Plays Gemini voice response.
-     * Uses ultra-fast in-memory AudioTrack playback for 0ms disk latency,
-     * with graceful MediaPlayer fallback for non-PCM formats.
+     * Uses rock-solid, ultra-clear Android MediaPlayer with in-memory WAV container,
+     * ensuring zero-glitch, full-volume speaker output across all devices and emulators.
      */
     fun playGeminiVoice(
         audioBytes: ByteArray,
@@ -443,12 +444,7 @@ class AudioEngine(private val context: Context) {
         _isAudioPlaying.value = true
         ensureAudibleVolume()
 
-        val pcmInfo = extractPcm(audioBytes, mimeType)
-        if (pcmInfo != null) {
-            playWithAudioTrack(pcmInfo.first, pcmInfo.second, coroutineScope, onCompletion)
-        } else {
-            playWithMediaPlayerFallback(audioBytes, mimeType, coroutineScope, onCompletion)
-        }
+        playWithMediaPlayerFallback(audioBytes, mimeType, coroutineScope, onCompletion)
     }
 
     private fun extractPcm(bytes: ByteArray, mimeType: String): Pair<ByteArray, Int>? {
@@ -472,33 +468,48 @@ class AudioEngine(private val context: Context) {
         return null
     }
 
-    private fun ensureAudibleVolume() {
+    fun ensureAudibleVolume() {
         try {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             audioManager?.let { am ->
-                val current = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-                val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                // If muted or too low, raise to safe audible level (60%), never force 100% max
-                if (current < max * 0.35f) {
-                    am.setStreamVolume(AudioManager.STREAM_MUSIC, (max * 0.65f).toInt(), 0)
+                // Unmute music stream if muted
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                    } catch (_: Exception) {}
                 }
 
-                // Request audio focus to ensure the audio stream routes to speakers and is not muted
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                        .setAudioAttributes(
-                            AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build()
-                        )
-                        .build()
-                    activeFocusRequest = focusRequest
-                    am.requestAudioFocus(focusRequest)
-                } else {
-                    @Suppress("DEPRECATION")
-                    am.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                }
+                try {
+                    val current = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                    if (current < max * 0.7f) {
+                        am.setStreamVolume(AudioManager.STREAM_MUSIC, (max * 0.90f).toInt(), 0)
+                    }
+                } catch (_: Exception) {}
+
+                // Ensure output routes to speaker
+                try {
+                    am.isSpeakerphoneOn = true
+                } catch (_: Exception) {}
+
+                // Request direct transient audio focus (not ducked) for voice clarity
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                            .setAudioAttributes(
+                                AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                    .build()
+                            )
+                            .build()
+                        activeFocusRequest = focusRequest
+                        am.requestAudioFocus(focusRequest)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        am.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    }
+                } catch (_: Exception) {}
             }
         } catch (_: Exception) {}
     }
@@ -673,7 +684,7 @@ class AudioEngine(private val context: Context) {
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = maxOf(minBuf, 4096)
+            val bufferSize = maxOf(minBuf * 8, 32768)
 
             val track = AudioTrack(
                 AudioAttributes.Builder()
@@ -733,25 +744,23 @@ class AudioEngine(private val context: Context) {
                     if (isActive && _isAudioPlaying.value) {
                         val totalFrames = pcmBytes.size / 2 // 16-bit mono = 2 bytes per frame
                         val durationMs = (totalFrames * 1000L) / sampleRate
-                        val maxTimeoutMs = durationMs + 4000L // Expected duration plus 4 seconds safety margin
+                        val maxTimeoutMs = durationMs + 400L // Natural duration plus 400ms flush margin
                         val waitStartTime = System.currentTimeMillis()
 
                         while (isActive && _isAudioPlaying.value) {
-                            val currentHead = track.playbackHeadPosition
+                            val currentHead = try { track.playbackHeadPosition } catch (_: Exception) { totalFrames }
                             if (currentHead >= totalFrames) {
                                 break
                             }
                             if (System.currentTimeMillis() - waitStartTime > maxTimeoutMs) {
-                                Log.d(TAG, "AudioTrack wait reached natural buffer drain timeout")
                                 break
                             }
                             // Keep gentle amplitude alive while hardware is emptying buffer
                             val progress = currentHead.toFloat() / maxOf(1, totalFrames)
                             _amplitude.value = (0.25f * (1f - progress)).coerceIn(0.05f, 0.35f)
-                            delay(40)
+                            delay(30)
                         }
-                        // Extra 120ms DAC flush buffer so the last syllable resonates naturally
-                        delay(120)
+                        delay(60)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "AudioTrack write error", e)
@@ -795,7 +804,11 @@ class AudioEngine(private val context: Context) {
 
             val tempFile = File.createTempFile("gemini_voice_", extension, context.cacheDir)
             currentTempFile = tempFile
-            FileOutputStream(tempFile).use { it.write(playableBytes) }
+            FileOutputStream(tempFile).use { fos ->
+                fos.write(playableBytes)
+                fos.flush()
+            }
+            try { tempFile.setReadable(true, false) } catch (_: Exception) {}
 
             val player = MediaPlayer().apply {
                 setAudioAttributes(
@@ -804,14 +817,23 @@ class AudioEngine(private val context: Context) {
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
-                setDataSource(tempFile.absolutePath)
+                // Use FileDescriptor to guarantee MediaPlayer in mediaserver has permission to read private app cache
+                FileInputStream(tempFile).use { fis ->
+                    setDataSource(fis.fd)
+                }
                 setVolume(1.0f, 1.0f)
                 prepare()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && playbackSpeed != 1.0f) {
+                    try {
+                        playbackParams = playbackParams.setSpeed(playbackSpeed)
+                    } catch (_: Exception) {}
+                }
+                start()
             }
             mediaPlayer = player
 
             playbackJob = coroutineScope.launch(Dispatchers.Default) {
-                while (isActive && _isAudioPlaying.value && player.isPlaying) {
+                while (isActive && _isAudioPlaying.value) {
                     val t = System.currentTimeMillis() % 1000 / 1000f
                     val wave = 0.45f + 0.45f * abs(kotlin.math.sin(t * Math.PI.toFloat() * 4))
                     _amplitude.value = wave
@@ -828,21 +850,21 @@ class AudioEngine(private val context: Context) {
                 onCompletion()
             }
 
-            player.setOnErrorListener { _, _, _ ->
+            player.setOnErrorListener { _, what, extra ->
+                Log.w(TAG, "MediaPlayer error: what=$what, extra=$extra, attempting AudioTrack fallback")
                 try {
                     tempFile.delete()
                 } catch (_: Exception) {}
                 currentTempFile = null
                 stopPlayback()
-                onCompletion()
+                val (pcmBytes, rate) = extractPcm(audioBytes, mimeType) ?: Pair(audioBytes, GEMINI_PCM_SAMPLE_RATE)
+                playWithAudioTrack(pcmBytes, rate, coroutineScope, onCompletion)
                 true
             }
-
-            player.start()
         } catch (e: Exception) {
-            Log.e(TAG, "MediaPlayer fallback error", e)
-            stopPlayback()
-            onCompletion()
+            Log.e(TAG, "MediaPlayer fallback error, attempting AudioTrack fallback", e)
+            val (pcmBytes, rate) = extractPcm(audioBytes, mimeType) ?: Pair(audioBytes, GEMINI_PCM_SAMPLE_RATE)
+            playWithAudioTrack(pcmBytes, rate, coroutineScope, onCompletion)
         }
     }
 

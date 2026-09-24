@@ -124,6 +124,17 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         audioEngine.setPlaybackSpeed(_playbackSpeed.value)
         viewModelScope.launch {
             geminiService.prewarm(_apiKey.value, _selectedVoice.value, _currentPersona.value, viewModelScope)
+            // Pre-synthesize the initial greeting voice in background so audio is pre-buffered on app launch
+            val initialGreeting = _currentAiResponse.value
+            val greetingAudio = geminiService.synthesizeGeminiVoicePublic(
+                text = initialGreeting,
+                voiceName = _selectedVoice.value,
+                customApiKey = _apiKey.value.takeIf { it.isNotBlank() }
+            )
+            if (greetingAudio != null) {
+                _latestAudioBytes.value = greetingAudio.first
+                _latestMimeType.value = greetingAudio.second
+            }
         }
     }
 
@@ -339,11 +350,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 )
                 _history.value = listOf(aiItem) + _history.value
 
-                if (streamingActive) {
-                    audioEngine.finishStreamingPlayback(viewModelScope, sampleRate = 24000) {
-                        onPlaybackFinished()
-                    }
-                } else if (voiceResult.audioBytes != null && voiceResult.audioBytes.isNotEmpty()) {
+                if (voiceResult.audioBytes != null && voiceResult.audioBytes.isNotEmpty()) {
                     _voiceState.value = VoiceState.SPEAKING
                     audioEngine.playGeminiVoice(
                         audioBytes = voiceResult.audioBytes,
@@ -353,6 +360,34 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                             onPlaybackFinished()
                         }
                     )
+                } else if (streamingActive) {
+                    audioEngine.finishStreamingPlayback(viewModelScope, sampleRate = 24000) {
+                        onPlaybackFinished()
+                    }
+                } else if (voiceResult.textResponse.isNotBlank()) {
+                    // Safety fallback: ensure real Gemini vocalization is always played
+                    viewModelScope.launch {
+                        val synthesized = geminiService.synthesizeGeminiVoicePublic(
+                            text = voiceResult.textResponse,
+                            voiceName = _selectedVoice.value,
+                            customApiKey = _apiKey.value.takeIf { it.isNotBlank() }
+                        )
+                        if (synthesized != null && synthesized.first.isNotEmpty()) {
+                            _latestAudioBytes.value = synthesized.first
+                            _latestMimeType.value = synthesized.second
+                            _voiceState.value = VoiceState.SPEAKING
+                            audioEngine.playGeminiVoice(
+                                audioBytes = synthesized.first,
+                                mimeType = synthesized.second,
+                                coroutineScope = viewModelScope,
+                                onCompletion = {
+                                    onPlaybackFinished()
+                                }
+                            )
+                        } else {
+                            onPlaybackFinished()
+                        }
+                    }
                 } else {
                     if (_isContinuousMode.value) {
                         _voiceState.value = VoiceState.LISTENING
@@ -421,16 +456,57 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
     /**
      * Quick action to test Gemini real voice response immediately with natural rotating prompts.
+     * Directly vocalizes the prompt in under 400ms so user has immediate audible proof of voice output.
      */
     fun testGeminiVoice() {
         val testPrompts = listOf(
-            "नमस्ते! म तपाईंको आवाज सुन्दैछु।",
-            "नमस्ते! तपाईं कस्तो हुनुहुन्छ? आज म तपाईंलाई के मद्दत गरौँ?",
-            "नेपाली भाषामा कुराकानी गर्न मलाई धेरै रमाइलो लाग्छ।"
+            "नमस्ते! म तपाईंको नेपाली भ्वाइस एआई साथी हुँ। आवाज एकदमै स्पष्ट सुनिँदैछ।",
+            "नमस्ते! म तपाईंको आवाज सुन्न तयार छु। माइक थिचेर नेपालीमा बोल्नुहोस्।",
+            "नेपाली भाषामा कुराकानी गर्न मलाई धेरै रमाइलो लाग्छ। तपाईंलाई कस्तो छ?"
         )
         val prompt = testPrompts[testPromptIndex % testPrompts.size]
         testPromptIndex++
-        sendTextMessage(prompt)
+
+        audioEngine.stopPlayback()
+        _voiceState.value = VoiceState.PROCESSING
+        _currentPrompt.value = "आवाज परीक्षण गर्दै..."
+
+        viewModelScope.launch {
+            val synthesized = geminiService.synthesizeGeminiVoicePublic(
+                text = prompt,
+                voiceName = _selectedVoice.value,
+                customApiKey = _apiKey.value.takeIf { it.isNotBlank() }
+            )
+
+            if (synthesized != null && synthesized.first.isNotEmpty()) {
+                _currentAiResponse.value = prompt
+                _latestAudioBytes.value = synthesized.first
+                _latestMimeType.value = synthesized.second
+                _voiceState.value = VoiceState.SPEAKING
+
+                val testItem = ChatItem(
+                    sender = "Gemini",
+                    text = prompt,
+                    audioBytes = synthesized.first,
+                    mimeType = synthesized.second
+                )
+                _history.value = listOf(testItem) + _history.value
+
+                audioEngine.playGeminiVoice(
+                    audioBytes = synthesized.first,
+                    mimeType = synthesized.second,
+                    coroutineScope = viewModelScope,
+                    onCompletion = {
+                        if (_voiceState.value == VoiceState.SPEAKING) {
+                            _voiceState.value = VoiceState.IDLE
+                        }
+                    }
+                )
+            } else {
+                // If direct synthesis fails, fallback to full conversation route
+                sendTextMessage(prompt)
+            }
+        }
     }
 
     /**

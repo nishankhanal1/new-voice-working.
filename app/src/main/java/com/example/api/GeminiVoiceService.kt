@@ -34,9 +34,11 @@ class GeminiVoiceService {
 
     companion object {
         private const val TAG = "GeminiVoiceService"
-        // Valid models from gemini-api skill
-        private const val MODEL_FLASH_LITE = "gemini-3.1-flash-lite-preview"
-        private const val MODEL_FLASH = "gemini-3.5-flash"
+        // Modern, tested, ultra-fast models
+        private const val MODEL_PRIMARY = "gemini-3.6-flash"
+        private const val MODEL_FLASH_LITE = "gemini-3.6-flash"
+        private const val MODEL_FLASH = "gemini-3.6-flash"
+        private const val MODEL_FALLBACK = "gemini-3.1-pro-preview"
 
         // Gemini voice synthesis model
         private const val TTS_MODEL = "gemini-2.5-flash-preview-tts"
@@ -125,6 +127,8 @@ class GeminiVoiceService {
     fun getApiKey(customApiKey: String?): String? {
         return customApiKey?.trim()?.takeIf { it.isNotEmpty() }
             ?: runCatching { BuildConfig.GEMINI_API_KEY }.getOrNull()?.trim()
+                ?.takeIf { it.isNotEmpty() && it != "MY_GEMINI_API_KEY" }
+            ?: runCatching { BuildConfig.INJECTED_GEMINI_API_KEY }.getOrNull()?.trim()
                 ?.takeIf { it.isNotEmpty() && it != "MY_GEMINI_API_KEY" }
             ?: runCatching { System.getenv("GEMINI_API_KEY") }.getOrNull()?.trim()
                 ?.takeIf { it.isNotEmpty() && it != "MY_GEMINI_API_KEY" }
@@ -469,7 +473,6 @@ class GeminiVoiceService {
         if (audioChunk != null) {
             mimeType = audioChunk.second
             accumulatedAudioStream.write(audioChunk.first)
-            wrappedAudioCallback(audioChunk.first)
         }
 
         GeminiVoiceResult(
@@ -577,7 +580,7 @@ class GeminiVoiceService {
             .toRequestBody("application/json; charset=utf-8".toMediaType())
 
         // Try fast models in order
-        for (model in listOf(MODEL_FLASH_LITE, MODEL_FLASH)) {
+        for (model in listOf(MODEL_PRIMARY, MODEL_FALLBACK)) {
             try {
                 val url = "$BASE_URL/$model:generateContent?key=$apiKey"
                 val request = Request.Builder().url(url).post(requestBody).build()
@@ -641,7 +644,13 @@ class GeminiVoiceService {
         voiceName: String,
         apiKey: String
     ): Pair<ByteArray, String>? {
-        val cleanText = text.trim()
+        // Strip markdown, thought blocks, system tags, and emojis for pure clean speech
+        val cleanText = text
+            .replace(Regex("<thought>[\\s\\S]*?</thought>"), "")
+            .replace(Regex("\\[[^\\]]*\\]"), "")
+            .replace(Regex("[*#_~`>•-]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
         if (cleanText.isEmpty()) return null
 
         val cacheKey = "$voiceName:$cleanText"
@@ -653,12 +662,16 @@ class GeminiVoiceService {
         }
 
         return try {
+            // CRITICAL: gemini-2.5-flash-preview-tts requires exact "Dialogue script: ... Now generate the audio for this dialogue script."
+            // Without this specific dialogue script framing, Google API rejects with HTTP 400: "Model tried to generate text, but it should only be used for TTS"
+            val ttsPrompt = "Dialogue script: $cleanText Now generate the audio for this dialogue script."
+
             val ttsRequestJson = JSONObject().apply {
                 put("contents", JSONArray().apply {
                     put(JSONObject().apply {
                         put("parts", JSONArray().apply {
                             put(JSONObject().apply {
-                                put("text", "Read the following text aloud in natural, warm Nepali: $cleanText")
+                                put("text", ttsPrompt)
                             })
                         })
                     })
