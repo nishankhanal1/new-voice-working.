@@ -14,22 +14,31 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -56,6 +65,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.ui.ChatItem
+import com.example.ui.NepaliPersona
 
 // -------------------------------------------------------------------------------------------------
 // 1. SETTINGS DIALOG
@@ -64,7 +74,9 @@ import com.example.ui.ChatItem
 fun SettingsDialog(
     currentVoice: String,
     currentApiKey: String,
+    currentPersona: NepaliPersona = NepaliPersona.BUDDY,
     onVoiceSelected: (String) -> Unit,
+    onPersonaSelected: (NepaliPersona) -> Unit = {},
     onApiKeySaved: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -80,8 +92,7 @@ fun SettingsDialog(
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(
-            decorFitsSystemWindows = false,
-            usePlatformDefaultWidth = false
+            decorFitsSystemWindows = false
         )
     ) {
         Surface(
@@ -90,14 +101,15 @@ fun SettingsDialog(
             border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF4C1D95)),
             modifier = Modifier
                 .testTag("settings_dialog")
-                .fillMaxWidth(0.92f)
+                .fillMaxWidth()
+                .padding(16.dp)
                 .imePadding()
-                .padding(12.dp)
+                .navigationBarsPadding()
         ) {
             Column(
                 modifier = Modifier
-                    .verticalScroll(rememberScrollState())
                     .padding(20.dp)
+                    .verticalScroll(rememberScrollState())
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -112,6 +124,79 @@ fun SettingsDialog(
                     )
                     IconButton(onClick = onDismiss) {
                         Icon(Icons.Default.Close, contentDescription = "Close", tint = Color(0xFFC084FC))
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Conversational Persona selection
+                Text(
+                    text = "वार्तालाप शैली (Conversational Persona):",
+                    fontSize = 13.sp,
+                    color = Color(0xFFD8B4FE),
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "नेपाली अभिव्यक्तिको शैली रोज्नुहोस्:",
+                    fontSize = 10.sp,
+                    color = Color(0xFF9CA3AF)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    NepaliPersona.values().forEach { persona ->
+                        val isSelected = currentPersona == persona
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (isSelected) Color(0xFF3B1869) else Color(0xFF1C143B))
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isSelected) Color(0xFF38BDF8) else Color(0x336D28D9),
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                                .clickable { onPersonaSelected(persona) }
+                                .padding(horizontal = 12.dp, vertical = 10.dp)
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(if (isSelected) Color(0xFF0284C7) else Color(0xFF2E1065))
+                            ) {
+                                Text(
+                                    text = persona.badge,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = persona.titleNepali,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                                Text(
+                                    text = persona.subtitleNepali,
+                                    fontSize = 11.sp,
+                                    color = Color(0xFFC084FC)
+                                )
+                            }
+                            if (isSelected) {
+                                Icon(
+                                    Icons.Default.Check,
+                                    contentDescription = "Selected",
+                                    tint = Color(0xFF38BDF8),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -233,7 +318,12 @@ fun SettingsDialog(
 // -------------------------------------------------------------------------------------------------
 @Composable
 fun GetPlusDialog(onDismiss: () -> Unit) {
-    Dialog(onDismissRequest = onDismiss) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            decorFitsSystemWindows = false
+        )
+    ) {
         Surface(
             shape = RoundedCornerShape(26.dp),
             color = Color(0xFF130C29),
@@ -241,7 +331,8 @@ fun GetPlusDialog(onDismiss: () -> Unit) {
             modifier = Modifier
                 .testTag("get_plus_dialog")
                 .fillMaxWidth()
-                .padding(10.dp)
+                .padding(16.dp)
+                .navigationBarsPadding()
         ) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -323,9 +414,19 @@ fun GetPlusDialog(onDismiss: () -> Unit) {
 fun ChatHistoryDialog(
     history: List<ChatItem>,
     onReplay: (ChatItem) -> Unit,
+    onCopy: (ChatItem) -> Unit = {},
+    onToggleBookmark: (String) -> Unit = {},
+    onExportTranscript: () -> Unit = {},
+    onGenerateSummary: () -> Unit = {},
+    onClearHistory: () -> Unit = {},
     onDismiss: () -> Unit
 ) {
-    Dialog(onDismissRequest = onDismiss) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            decorFitsSystemWindows = false
+        )
+    ) {
         Surface(
             shape = RoundedCornerShape(24.dp),
             color = Color(0xFF120A28),
@@ -333,26 +434,93 @@ fun ChatHistoryDialog(
             modifier = Modifier
                 .testTag("chat_history_dialog")
                 .fillMaxWidth()
-                .padding(8.dp)
+                .padding(16.dp)
+                .navigationBarsPadding()
         ) {
             Column(
                 modifier = Modifier
                     .padding(18.dp)
-                    .heightIn(max = 500.dp)
+                    .heightIn(max = 540.dp)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text(
-                        text = "कुराकानी इतिहास (Conversation)",
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
+                    Column {
+                        Text(
+                            text = "कुराकानी इतिहास (Conversation)",
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                        Text(
+                            text = "${history.size} संवाद रेकर्ड (Memory & Bookmarks)",
+                            fontSize = 11.sp,
+                            color = Color(0xFFC084FC)
+                        )
+                    }
                     IconButton(onClick = onDismiss) {
                         Icon(Icons.Default.Close, contentDescription = "Close", tint = Color(0xFFC084FC))
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Action Bar: Summary & Export Transcript
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    // AI Summary button
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF2E1065))
+                            .border(1.dp, Color(0xFF7C3AED), RoundedCornerShape(8.dp))
+                            .clickable { onGenerateSummary() }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Psychology,
+                            contentDescription = null,
+                            tint = Color(0xFF38BDF8),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "सारांश (Summary)",
+                            fontSize = 11.sp,
+                            color = Color(0xFF38BDF8),
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    // Export Transcript button
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF1E143B))
+                            .border(1.dp, Color(0xFF4C1D95), RoundedCornerShape(8.dp))
+                            .clickable { onExportTranscript() }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Share,
+                            contentDescription = null,
+                            tint = Color(0xFFD8B4FE),
+                            modifier = Modifier.size(13.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "ट्रान्सक्रिप्ट (Export)",
+                            fontSize = 11.sp,
+                            color = Color(0xFFD8B4FE),
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
                 }
 
@@ -380,14 +548,15 @@ fun ChatHistoryDialog(
                             ) {
                                 Column(
                                     modifier = Modifier
-                                        .fillMaxWidth(0.88f)
+                                        .fillMaxWidth(0.95f)
                                         .clip(RoundedCornerShape(16.dp))
                                         .background(
                                             if (isUser) Color(0xFF3B1869) else Color(0xFF1F1440)
                                         )
                                         .border(
                                             1.dp,
-                                            if (isUser) Color(0xFFA855F7) else Color(0x337C3AED),
+                                            if (item.isBookmarked) Color(0xFFFBBF24)
+                                            else if (isUser) Color(0xFFA855F7) else Color(0x337C3AED),
                                             RoundedCornerShape(16.dp)
                                         )
                                         .padding(12.dp)
@@ -403,11 +572,22 @@ fun ChatHistoryDialog(
                                             fontWeight = FontWeight.Bold,
                                             color = if (isUser) Color(0xFFF472B6) else Color(0xFF38BDF8)
                                         )
-                                        Text(
-                                            text = item.timestamp,
-                                            fontSize = 10.sp,
-                                            color = Color(0xFF9CA3AF)
-                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                text = item.timestamp,
+                                                fontSize = 10.sp,
+                                                color = Color(0xFF9CA3AF)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Icon(
+                                                imageVector = if (item.isBookmarked) Icons.Default.Star else Icons.Default.StarBorder,
+                                                contentDescription = "Bookmark",
+                                                tint = if (item.isBookmarked) Color(0xFFFBBF24) else Color(0xFF6B7280),
+                                                modifier = Modifier
+                                                    .size(17.dp)
+                                                    .clickable { onToggleBookmark(item.id) }
+                                            )
+                                        }
                                     }
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
@@ -416,33 +596,88 @@ fun ChatHistoryDialog(
                                         color = Color.White
                                     )
 
-                                    if (!isUser && item.audioBytes != null) {
-                                        Spacer(modifier = Modifier.height(6.dp))
+                                    Spacer(modifier = Modifier.height(8.dp))
+
+                                    // Action buttons for message (Play, Share, Copy)
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        if (!isUser && (item.audioBytes != null || item.text.isNotBlank())) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(8.dp))
+                                                    .background(Color(0xFF2E1065))
+                                                    .clickable { onReplay(item) }
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.PlayArrow,
+                                                    contentDescription = "Replay voice",
+                                                    tint = Color(0xFFE879F9),
+                                                    modifier = Modifier.size(15.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(3.dp))
+                                                Text(
+                                                    text = "सुन्नुहोस्",
+                                                    fontSize = 11.sp,
+                                                    color = Color(0xFFE879F9),
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            }
+                                        }
+
+                                        // Copy response text
                                         Row(
                                             verticalAlignment = Alignment.CenterVertically,
                                             modifier = Modifier
                                                 .clip(RoundedCornerShape(8.dp))
-                                                .background(Color(0xFF2E1065))
-                                                .clickable { onReplay(item) }
+                                                .background(Color(0xFF1E143B))
+                                                .clickable { onCopy(item) }
                                                 .padding(horizontal = 8.dp, vertical = 4.dp)
                                         ) {
                                             Icon(
-                                                Icons.Default.PlayArrow,
-                                                contentDescription = "Replay voice",
-                                                tint = Color(0xFFE879F9),
-                                                modifier = Modifier.size(16.dp)
+                                                Icons.Default.ContentCopy,
+                                                contentDescription = "Copy",
+                                                tint = Color(0xFFD8B4FE),
+                                                modifier = Modifier.size(13.dp)
                                             )
-                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Spacer(modifier = Modifier.width(3.dp))
                                             Text(
-                                                text = "आवाज सुन्नुहोस् (Replay)",
+                                                text = "कपी",
                                                 fontSize = 11.sp,
-                                                color = Color(0xFFE879F9),
-                                                fontWeight = FontWeight.SemiBold
+                                                color = Color(0xFFD8B4FE)
                                             )
                                         }
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Bottom: Clear History Button
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.End,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        TextButton(
+                            onClick = {
+                                onClearHistory()
+                                onDismiss()
+                            }
+                        ) {
+                            Icon(
+                                Icons.Default.DeleteOutline,
+                                contentDescription = "Clear History",
+                                tint = Color(0xFFF87171),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("नयाँ कुराकानी सुरु (Clear)", color = Color(0xFFF87171), fontSize = 12.sp)
                         }
                     }
                 }
@@ -470,8 +705,7 @@ fun TextInputDialog(
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(
-            decorFitsSystemWindows = false,
-            usePlatformDefaultWidth = false
+            decorFitsSystemWindows = false
         )
     ) {
         Surface(
@@ -480,14 +714,15 @@ fun TextInputDialog(
             border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF4C1D95)),
             modifier = Modifier
                 .testTag("text_input_dialog")
-                .fillMaxWidth(0.92f)
+                .fillMaxWidth()
+                .padding(16.dp)
                 .imePadding()
-                .padding(10.dp)
+                .navigationBarsPadding()
         ) {
             Column(
                 modifier = Modifier
-                    .verticalScroll(rememberScrollState())
                     .padding(18.dp)
+                    .verticalScroll(rememberScrollState())
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,

@@ -43,13 +43,17 @@ import androidx.compose.ui.unit.sp
 
 /**
  * Dedicated Audio Output control bar where the user can directly
- * listen to, pause, or replay Gemini's spoken voice response.
+ * listen to, pause, replay, or test Gemini's spoken voice response.
  */
 @Composable
 fun GeminiAudioOutputBar(
     isPlaying: Boolean,
     selectedVoice: String,
+    hasResponse: Boolean = false,
+    playbackSpeed: Float = 1.0f,
+    onSpeedChange: (Float) -> Unit = {},
     onTogglePlay: () -> Unit,
+    onTestVoice: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "audio_bars")
@@ -57,7 +61,7 @@ fun GeminiAudioOutputBar(
     // Pulsing scale for speaker icon when audio is actively playing
     val pulseScale by infiniteTransition.animateFloat(
         initialValue = 1.0f,
-        targetValue = if (isPlaying) 1.18f else 1.0f,
+        targetValue = if (isPlaying) 1.15f else 1.0f,
         animationSpec = infiniteRepeatable(
             animation = tween(600, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
@@ -68,7 +72,7 @@ fun GeminiAudioOutputBar(
     // Animated sound wave bars
     val bar1Height by infiniteTransition.animateFloat(
         initialValue = 6f,
-        targetValue = if (isPlaying) 20f else 6f,
+        targetValue = if (isPlaying) 18f else 6f,
         animationSpec = infiniteRepeatable(
             animation = tween(450, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
@@ -77,8 +81,8 @@ fun GeminiAudioOutputBar(
     )
 
     val bar2Height by infiniteTransition.animateFloat(
-        initialValue = 10f,
-        targetValue = if (isPlaying) 26f else 10f,
+        initialValue = 9f,
+        targetValue = if (isPlaying) 24f else 9f,
         animationSpec = infiniteRepeatable(
             animation = tween(380, delayMillis = 100, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
@@ -88,7 +92,7 @@ fun GeminiAudioOutputBar(
 
     val bar3Height by infiniteTransition.animateFloat(
         initialValue = 5f,
-        targetValue = if (isPlaying) 18f else 5f,
+        targetValue = if (isPlaying) 16f else 5f,
         animationSpec = infiniteRepeatable(
             animation = tween(520, delayMillis = 150, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
@@ -97,29 +101,29 @@ fun GeminiAudioOutputBar(
     )
 
     val borderColor by animateColorAsState(
-        targetValue = if (isPlaying) Color(0xFFA855F7) else Color(0xFF382363),
+        targetValue = if (isPlaying) Color(0xFFA855F7) else Color(0xFF2E1C52),
         label = "border_color"
     )
 
     val buttonBgColor by animateColorAsState(
-        targetValue = if (isPlaying) Color(0xFFDC2626) else Color(0xFF9333EA),
+        targetValue = if (isPlaying) Color(0xFFE11D48) else Color(0xFF7C3AED),
         label = "btn_bg"
     )
 
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
+            .clip(RoundedCornerShape(18.dp))
             .background(
                 Brush.horizontalGradient(
                     colors = listOf(
-                        Color(0xFF190F33).copy(alpha = 0.95f),
-                        Color(0xFF140A28).copy(alpha = 0.95f)
+                        Color(0xFF140C2B),
+                        Color(0xFF0F0822)
                     )
                 )
             )
-            .border(1.dp, borderColor, RoundedCornerShape(20.dp))
-            .padding(horizontal = 14.dp, vertical = 10.dp)
+            .border(1.dp, borderColor, RoundedCornerShape(18.dp))
+            .padding(horizontal = 14.dp, vertical = 11.dp)
             .testTag("audio_output_card")
     ) {
         Row(
@@ -127,22 +131,23 @@ fun GeminiAudioOutputBar(
             horizontalArrangement = Arrangement.SpaceBetween,
             modifier = Modifier.fillMaxWidth()
         ) {
-            // Left: Speaker icon & Equalizer
+            // Left: Speaker icon & Info
             Row(
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f, fill = false)
             ) {
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
-                        .size(42.dp)
+                        .size(38.dp)
                         .clip(CircleShape)
                         .background(
                             if (isPlaying) Color(0xFF7E22CE).copy(alpha = 0.35f)
-                            else Color(0xFF2E1A54)
+                            else Color(0xFF221242)
                         )
                         .border(
                             1.dp,
-                            if (isPlaying) Color(0xFFA855F7) else Color(0xFF4C2A85),
+                            if (isPlaying) Color(0xFFA855F7) else Color(0xFF432578),
                             CircleShape
                         )
                 ) {
@@ -151,32 +156,32 @@ fun GeminiAudioOutputBar(
                         contentDescription = "Audio Output Speaker",
                         tint = if (isPlaying) Color(0xFF38BDF8) else Color(0xFFC084FC),
                         modifier = Modifier
-                            .size(20.dp)
+                            .size(19.dp)
                             .scale(pulseScale)
                     )
                 }
 
-                Spacer(modifier = Modifier.width(12.dp))
+                Spacer(modifier = Modifier.width(11.dp))
 
                 Column {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = "Gemini Voice Output",
+                            text = "Gemini Real Voice",
                             fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold,
+                            fontWeight = FontWeight.SemiBold,
                             color = Color.White
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(4.dp))
-                                .background(Color(0xFF2D1854))
+                                .background(Color(0xFF2B1650))
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
                             Text(
                                 text = selectedVoice,
                                 fontSize = 9.sp,
-                                fontWeight = FontWeight.SemiBold,
+                                fontWeight = FontWeight.Bold,
                                 color = Color(0xFFE9D5FF)
                             )
                         }
@@ -185,16 +190,17 @@ fun GeminiAudioOutputBar(
                     Spacer(modifier = Modifier.height(2.dp))
 
                     Text(
-                        text = if (isPlaying) "आवाज बोल्दैछ... (Speaking now)" else "जवाफ सुन्नुहोस् (Tap to hear)",
+                        text = if (isPlaying) "नेपालीमा बोल्दैछ..." else if (hasResponse) "जवाफ सुन्न ट्याप गर्नुहोस्" else "आवाज आउटपुट तयार छ",
                         fontSize = 11.sp,
-                        color = if (isPlaying) Color(0xFF38BDF8) else Color(0xFFDDD6FE)
+                        color = if (isPlaying) Color(0xFF38BDF8) else Color(0xFFA78BFA)
                     )
                 }
             }
 
-            // Right: Mini Equalizer + Play/Stop Action Button
+            // Right: Actions Row (Equalizer + Test Voice + Play/Stop)
             Row(
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 // Mini 3-bar animated equalizer when playing
                 if (isPlaying) {
@@ -202,8 +208,8 @@ fun GeminiAudioOutputBar(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(3.dp),
                         modifier = Modifier
-                            .height(28.dp)
-                            .padding(end = 10.dp)
+                            .height(24.dp)
+                            .padding(end = 4.dp)
                     ) {
                         Box(
                             modifier = Modifier
@@ -229,14 +235,62 @@ fun GeminiAudioOutputBar(
                     }
                 }
 
+                // Playback Speed Toggle (0.8x -> 1.0x -> 1.25x)
+                val speedLabel = when {
+                    playbackSpeed <= 0.85f -> "०.८x"
+                    playbackSpeed >= 1.2f -> "१.२x"
+                    else -> "१.०x"
+                }
+                val nextSpeed = when {
+                    playbackSpeed <= 0.85f -> 1.0f
+                    playbackSpeed in 0.86f..1.1f -> 1.25f
+                    else -> 0.8f
+                }
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xFF22133D))
+                        .border(1.dp, Color(0xFF4C277E), RoundedCornerShape(14.dp))
+                        .clickable { onSpeedChange(nextSpeed) }
+                        .padding(horizontal = 9.dp, vertical = 6.dp)
+                        .testTag("playback_speed_button")
+                ) {
+                    Text(
+                        text = speedLabel,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF38BDF8)
+                    )
+                }
+
+                // Test Voice Output Button (Quick test prompt)
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xFF22133D))
+                        .border(1.dp, Color(0xFF4C277E), RoundedCornerShape(14.dp))
+                        .clickable(onClick = onTestVoice)
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                        .testTag("test_voice_output_button")
+                ) {
+                    Text(
+                        text = "परीक्षण",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFFD8B4FE)
+                    )
+                }
+
                 // Interactive Audio Output Play/Stop Button
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
-                        .clip(RoundedCornerShape(24.dp))
+                        .clip(RoundedCornerShape(16.dp))
                         .background(buttonBgColor)
                         .clickable(onClick = onTogglePlay)
-                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                        .padding(horizontal = 12.dp, vertical = 7.dp)
                         .testTag("audio_output_play_button")
                 ) {
                     Row(
@@ -247,12 +301,12 @@ fun GeminiAudioOutputBar(
                             imageVector = if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
                             contentDescription = if (isPlaying) "Stop Audio" else "Play Audio",
                             tint = Color.White,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = if (isPlaying) "रोक्नुहोस्" else "सुन्नुहोस्",
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color.White
                         )

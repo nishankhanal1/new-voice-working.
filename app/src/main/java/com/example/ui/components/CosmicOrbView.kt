@@ -7,6 +7,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -26,8 +27,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -71,19 +74,79 @@ fun CosmicOrbView(
         label = "orb_pulse"
     )
 
+    // Fluid organic expansion ripples for Voice harmonics
+    val rippleProgress1 by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 2000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "fluid_ripple_1"
+    )
+
+    val rippleProgress2 by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 2000, delayMillis = 1000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "fluid_ripple_2"
+    )
+
     val dynamicScale = when (voiceState) {
-        VoiceState.LISTENING -> pulseScale + (amplitude * 0.15f)
-        VoiceState.SPEAKING -> 1.0f + (amplitude * 0.18f)
+        VoiceState.LISTENING -> pulseScale + (amplitude * 0.16f)
+        VoiceState.SPEAKING -> 1.0f + (amplitude * 0.20f)
         VoiceState.PROCESSING -> pulseScale
         else -> 1.0f
+    }
+
+    val statePrimaryColor = when (voiceState) {
+        VoiceState.LISTENING -> Color(0xFF38BDF8) // Cyan / Sky Blue
+        VoiceState.SPEAKING -> Color(0xFFC084FC) // Electric Purple
+        VoiceState.PROCESSING -> Color(0xFFFBBF24) // Amber / Solar
+        VoiceState.ERROR -> Color(0xFFF87171) // Coral Red
+        VoiceState.IDLE -> Color(0xFFA855F7) // Purple
     }
 
     Box(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .testTag("cosmic_orb_container")
-            .size(290.dp)
+            .size(310.dp)
     ) {
+        // Fluid Ripple Canvas rings reacting to voice amplitude
+        Canvas(
+            modifier = Modifier.size(310.dp)
+        ) {
+            val center = Offset(size.width / 2f, size.height / 2f)
+            val baseRadius = 110.dp.toPx()
+            val maxExpansion = 42.dp.toPx() + (amplitude * 35.dp.toPx())
+
+            if (voiceState == VoiceState.LISTENING || voiceState == VoiceState.SPEAKING) {
+                // Ring 1
+                val r1 = baseRadius + (rippleProgress1 * maxExpansion)
+                val alpha1 = (1f - rippleProgress1).coerceIn(0f, 0.6f) * (0.3f + amplitude * 0.7f)
+                drawCircle(
+                    color = statePrimaryColor.copy(alpha = alpha1),
+                    radius = r1,
+                    center = center,
+                    style = Stroke(width = (2.5f * (1f - rippleProgress1)).dp.toPx())
+                )
+
+                // Ring 2
+                val r2 = baseRadius + (rippleProgress2 * maxExpansion)
+                val alpha2 = (1f - rippleProgress2).coerceIn(0f, 0.6f) * (0.3f + amplitude * 0.7f)
+                drawCircle(
+                    color = Color(0xFFF472B6).copy(alpha = alpha2),
+                    radius = r2,
+                    center = center,
+                    style = Stroke(width = (2.5f * (1f - rippleProgress2)).dp.toPx())
+                )
+            }
+        }
+
         // Outer radiant aura / bloom glow
         Box(
             modifier = Modifier
@@ -93,7 +156,7 @@ fun CosmicOrbView(
                 .background(
                     Brush.radialGradient(
                         colors = listOf(
-                            Color(0x55A855F7),
+                            statePrimaryColor.copy(alpha = 0.35f),
                             Color(0x227C3AED),
                             Color(0x00000000)
                         )
@@ -110,7 +173,7 @@ fun CosmicOrbView(
                 .shadow(
                     elevation = 24.dp,
                     shape = CircleShape,
-                    ambientColor = Color(0xFFC084FC),
+                    ambientColor = statePrimaryColor,
                     spotColor = Color(0xFFA855F7)
                 )
                 .clip(CircleShape)
@@ -119,8 +182,8 @@ fun CosmicOrbView(
                     brush = Brush.sweepGradient(
                         listOf(
                             Color(0xFFE879F9),
+                            statePrimaryColor,
                             Color(0xFF818CF8),
-                            Color(0xFFC084FC),
                             Color(0xFFE879F9)
                         )
                     ),
