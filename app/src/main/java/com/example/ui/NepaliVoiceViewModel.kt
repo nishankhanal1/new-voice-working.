@@ -82,7 +82,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     private val _latestAudioBytes = MutableStateFlow<ByteArray?>(null)
     val latestAudioBytes: StateFlow<ByteArray?> = _latestAudioBytes.asStateFlow()
 
-    private val _latestMimeType = MutableStateFlow<String?>("audio/pcm;rate=24000")
+    private val _latestMimeType = MutableStateFlow<String?>("audio/L16;codec=pcm;rate=24000")
     val latestMimeType: StateFlow<String?> = _latestMimeType.asStateFlow()
 
     private val _selectedVoice = MutableStateFlow(prefs.getString("selected_voice", "Puck") ?: "Puck")
@@ -94,6 +94,17 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     private val _playbackSpeed = MutableStateFlow(prefs.getFloat("playback_speed", 1.0f))
     val playbackSpeed: StateFlow<Float> = _playbackSpeed.asStateFlow()
 
+    private val _silenceTimeoutMs = MutableStateFlow(prefs.getLong("silence_timeout_ms", 750L))
+    val silenceTimeoutMs: StateFlow<Long> = _silenceTimeoutMs.asStateFlow()
+
+    fun setSilenceTimeout(timeout: Long) {
+        val valid = timeout.coerceIn(500L, 2500L)
+        _silenceTimeoutMs.value = valid
+        prefs.edit().putLong("silence_timeout_ms", valid).apply()
+        audioEngine.setSilenceTimeoutMs(valid)
+        hapticHelper.tick()
+    }
+
     fun setPlaybackSpeed(speed: Float) {
         val validSpeed = speed.coerceIn(0.7f, 1.5f)
         _playbackSpeed.value = validSpeed
@@ -103,7 +114,6 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun askQuickTopic(topicText: String) {
-        if (_voiceState.value == VoiceState.PROCESSING) return
         hapticHelper.click()
         sendTextMessage(topicText)
     }
@@ -122,9 +132,10 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
     init {
         audioEngine.setPlaybackSpeed(_playbackSpeed.value)
+        audioEngine.setSilenceTimeoutMs(_silenceTimeoutMs.value)
         viewModelScope.launch {
             geminiService.prewarm(_apiKey.value, _selectedVoice.value, _currentPersona.value, viewModelScope)
-            // Pre-synthesize the initial greeting voice in background so audio is pre-buffered on app launch
+            // Pre-warm initial greeting in background
             val initialGreeting = _currentAiResponse.value
             val greetingAudio = geminiService.synthesizeGeminiVoicePublic(
                 text = initialGreeting,
@@ -144,18 +155,18 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     /**
      * Primary mic button toggle:
      * - If IDLE: starts listening.
-     * - If LISTENING: stops listening, immediately calls Gemini AI.
-     * - If SPEAKING: stops speech, starts listening fresh.
-     * - If PROCESSING: cancels ongoing network call.
+     * - If LISTENING: stops listening, immediately processes voice.
+     * - If SPEAKING or PROCESSING: INTERRUPTS Gemini immediately and starts fresh listening!
      */
     fun onMicToggled() {
         val now = System.currentTimeMillis()
-        if (now - lastMicToggleTime < 350L || isTogglingMic) {
+        if (now - lastMicToggleTime < 250L || isTogglingMic) {
             return
         }
         lastMicToggleTime = now
         isTogglingMic = true
         hapticHelper.click()
+
         try {
             when (_voiceState.value) {
                 VoiceState.IDLE, VoiceState.ERROR -> {
@@ -164,12 +175,12 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 VoiceState.LISTENING -> {
                     stopListeningAndProcess()
                 }
-                VoiceState.SPEAKING -> {
-                    audioEngine.stopPlayback()
+                VoiceState.SPEAKING, VoiceState.PROCESSING -> {
+                    // Barge-In: user interrupts Gemini speech!
+                    // Instantly abort previous audio & network call, and start listening fresh
+                    interruptAndStop()
+                    hapticHelper.bargeInPulse()
                     startListening()
-                }
-                VoiceState.PROCESSING -> {
-                    cancelCurrentOperation()
                 }
             }
         } finally {
@@ -177,9 +188,20 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    /**
+     * Instantly aborts ongoing Gemini speech, network streaming, and active jobs.
+     */
+    private fun interruptAndStop() {
+        activeCallJob?.cancel()
+        geminiService.cancelAllActiveCalls()
+        audioEngine.stopPlayback()
+        audioEngine.stopRecording()
+    }
+
     private fun startListening() {
         _errorMessage.value = null
-        audioEngine.stopPlayback()
+        interruptAndStop()
+
         val started = audioEngine.startRecording(
             coroutineScope = viewModelScope,
             autoSilenceDetection = true,
@@ -189,7 +211,6 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 hapticHelper.tick()
             },
             onSpeechFinished = {
-                geminiService.liveVoiceClient.commitRealtimeTurn()
                 viewModelScope.launch(Dispatchers.Main) {
                     if (_voiceState.value == VoiceState.LISTENING) {
                         stopListeningAndProcess()
@@ -201,36 +222,28 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                     onBargeInTriggered()
                 }
             },
-            onAudioChunkRecorded = { pcmChunk, sampleRate ->
-                geminiService.liveVoiceClient.sendRealtimeAudioChunk(pcmChunk, sampleRate)
-            }
+            onAudioChunkRecorded = { _, _ -> }
         )
+
         if (started) {
             _voiceState.value = VoiceState.LISTENING
             _currentPrompt.value = if (_isContinuousMode.value) {
                 "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
             } else {
-                "सुन्दैछ... बोल्नुहोस् (Listening... Speak now)"
+                "सुन्दैछ... बोल्नुहोस् (Listening...)"
             }
-            // Pre-warm connection and Live WebSocket in background while user speaks to eliminate latency
             viewModelScope.launch {
                 geminiService.prewarm(_apiKey.value, _selectedVoice.value, _currentPersona.value, viewModelScope)
             }
         } else {
-            _errorMessage.value = "माइक्रोफोन सुरु हुन सकेन। कृपया अनुमति जाँच गर्नुहोस्।"
+            _errorMessage.value = "माइक्रोफोन सुरु हुन सकेन। कृपया अडियो अनुमति जाँच गर्नुहोस्।"
             _voiceState.value = VoiceState.ERROR
         }
     }
 
-    /**
-     * Instantly interrupts AI playback when user begins speaking,
-     * canceling the outgoing audio and streaming turn cleanly.
-     */
     private fun onBargeInTriggered() {
         hapticHelper.bargeInPulse()
-        audioEngine.stopPlayback()
-        geminiService.liveVoiceClient.cancelCurrentTurn()
-        activeCallJob?.cancel()
+        interruptAndStop()
         _currentPrompt.value = "सुन्दैछ... बोल्नुहोस्"
         _voiceState.value = VoiceState.LISTENING
     }
@@ -245,12 +258,11 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
         if (audioBase64Wav.isNullOrEmpty()) {
             if (_isContinuousMode.value) {
-                // In continuous mode, continue listening seamlessly without breaking
                 _voiceState.value = VoiceState.LISTENING
                 _currentPrompt.value = "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
             } else {
                 _voiceState.value = VoiceState.IDLE
-                _currentPrompt.value = "कुनै आवाज सुनिएन। फेरि प्रयास गर्नुहोस्।"
+                _currentPrompt.value = "कुनै आवाज सुनिएन। फेरि बोल्नुहोस्।"
             }
             return
         }
@@ -261,10 +273,15 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
     /**
      * Sends typed text prompt directly.
+     * INSTANTLY stops any ongoing Gemini voice generation, speech playback, or mic recording
+     * and replies to the new input in the current conversational situation.
      */
     fun sendTextMessage(text: String) {
         if (text.isBlank()) return
-        audioEngine.stopPlayback()
+        // Instant interruption: abort ongoing speech/network calls
+        interruptAndStop()
+        hapticHelper.click()
+
         _voiceState.value = VoiceState.PROCESSING
         _currentPrompt.value = text
 
@@ -277,10 +294,13 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     private fun callGeminiApi(audioBase64Wav: String?, textPrompt: String?) {
         activeCallJob?.cancel()
         activeCallJob = viewModelScope.launch {
-            var streamingActive = false
-
-            // Extract previous turns for long-term multi-turn conversation memory (bounded window for fast latency)
-            val historyPairs = _history.value.reversed().takeLast(16).map { item ->
+            val allHistoryReversed = _history.value.reversed()
+            val priorItems = if (textPrompt != null && allHistoryReversed.lastOrNull()?.text == textPrompt) {
+                allHistoryReversed.dropLast(1)
+            } else {
+                allHistoryReversed
+            }
+            val historyPairs = priorItems.takeLast(6).map { item ->
                 val role = if (item.sender == "User") "user" else "model"
                 Pair(role, item.text)
             }
@@ -298,6 +318,8 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             }
 
             var userTranscribedEmitted = false
+            var firstChunkReceived = false
+
             val result = geminiService.converseNepaliStreaming(
                 audioBase64Wav = audioBase64Wav,
                 textPrompt = textPrompt,
@@ -312,13 +334,20 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                     _history.value = listOf(userItem) + _history.value
                 },
                 onFirstAudioChunk = {
-                    streamingActive = true
+                    firstChunkReceived = true
                     _voiceState.value = VoiceState.SPEAKING
-                    hapticHelper.tick()
-                    audioEngine.prepareStreamingPlayback(sampleRate = 24000)
                 },
-                onAudioChunk = { pcmChunk ->
-                    audioEngine.writeStreamingChunk(pcmChunk)
+                onAudioChunk = { chunk ->
+                    // Play streaming sentence chunk immediately
+                    _voiceState.value = VoiceState.SPEAKING
+                    audioEngine.playGeminiVoice(
+                        audioBytes = chunk,
+                        mimeType = "audio/L16;codec=pcm;rate=24000",
+                        coroutineScope = viewModelScope,
+                        onCompletion = {
+                            onPlaybackFinished()
+                        }
+                    )
                 },
                 onTextChunk = { partialText ->
                     _currentAiResponse.value = partialText
@@ -350,45 +379,18 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 )
                 _history.value = listOf(aiItem) + _history.value
 
-                if (voiceResult.audioBytes != null && voiceResult.audioBytes.isNotEmpty()) {
+                // If pipelined streaming didn't already start playing audio, play it now
+                if (!firstChunkReceived && voiceResult.audioBytes != null && voiceResult.audioBytes.isNotEmpty()) {
                     _voiceState.value = VoiceState.SPEAKING
                     audioEngine.playGeminiVoice(
                         audioBytes = voiceResult.audioBytes,
-                        mimeType = voiceResult.mimeType ?: "audio/pcm;rate=24000",
+                        mimeType = voiceResult.mimeType ?: "audio/L16;codec=pcm;rate=24000",
                         coroutineScope = viewModelScope,
                         onCompletion = {
                             onPlaybackFinished()
                         }
                     )
-                } else if (streamingActive) {
-                    audioEngine.finishStreamingPlayback(viewModelScope, sampleRate = 24000) {
-                        onPlaybackFinished()
-                    }
-                } else if (voiceResult.textResponse.isNotBlank()) {
-                    // Safety fallback: ensure real Gemini vocalization is always played
-                    viewModelScope.launch {
-                        val synthesized = geminiService.synthesizeGeminiVoicePublic(
-                            text = voiceResult.textResponse,
-                            voiceName = _selectedVoice.value,
-                            customApiKey = _apiKey.value.takeIf { it.isNotBlank() }
-                        )
-                        if (synthesized != null && synthesized.first.isNotEmpty()) {
-                            _latestAudioBytes.value = synthesized.first
-                            _latestMimeType.value = synthesized.second
-                            _voiceState.value = VoiceState.SPEAKING
-                            audioEngine.playGeminiVoice(
-                                audioBytes = synthesized.first,
-                                mimeType = synthesized.second,
-                                coroutineScope = viewModelScope,
-                                onCompletion = {
-                                    onPlaybackFinished()
-                                }
-                            )
-                        } else {
-                            onPlaybackFinished()
-                        }
-                    }
-                } else {
+                } else if (!firstChunkReceived && (voiceResult.audioBytes == null || voiceResult.audioBytes.isEmpty())) {
                     if (_isContinuousMode.value) {
                         _voiceState.value = VoiceState.LISTENING
                         _currentPrompt.value = "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
@@ -425,9 +427,6 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    /**
-     * Copies the Gemini response to the clipboard.
-     */
     fun copyResponse(context: Context, textToCopy: String? = null) {
         val text = textToCopy?.takeIf { it.isNotBlank() } ?: _currentAiResponse.value
         if (text.isBlank()) return
@@ -439,9 +438,6 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         } catch (_: Exception) {}
     }
 
-    /**
-     * Clears conversation history to start fresh.
-     */
     fun clearHistory() {
         _history.value = listOf(
             ChatItem(
@@ -454,10 +450,6 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
     private var testPromptIndex = 0
 
-    /**
-     * Quick action to test Gemini real voice response immediately with natural rotating prompts.
-     * Directly vocalizes the prompt in under 400ms so user has immediate audible proof of voice output.
-     */
     fun testGeminiVoice() {
         val testPrompts = listOf(
             "नमस्ते! म तपाईंको नेपाली भ्वाइस एआई साथी हुँ। आवाज एकदमै स्पष्ट सुनिँदैछ।",
@@ -467,7 +459,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         val prompt = testPrompts[testPromptIndex % testPrompts.size]
         testPromptIndex++
 
-        audioEngine.stopPlayback()
+        interruptAndStop()
         _voiceState.value = VoiceState.PROCESSING
         _currentPrompt.value = "आवाज परीक्षण गर्दै..."
 
@@ -503,24 +495,17 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                     }
                 )
             } else {
-                // If direct synthesis fails, fallback to full conversation route
                 sendTextMessage(prompt)
             }
         }
     }
 
-    /**
-     * Lifecycle callback when app moves to background.
-     */
     fun onAppBackgrounded() {
         if (_voiceState.value == VoiceState.LISTENING || _voiceState.value == VoiceState.SPEAKING) {
             cancelCurrentOperation()
         }
     }
 
-    /**
-     * Toggles or plays the latest audio response directly from the Audio Output UI.
-     */
     fun togglePlayLatestAudio() {
         if (audioEngine.isAudioPlaying.value) {
             audioEngine.stopPlayback()
@@ -535,7 +520,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             _voiceState.value = VoiceState.SPEAKING
             audioEngine.playGeminiVoice(
                 audioBytes = audio,
-                mimeType = _latestMimeType.value ?: "audio/pcm;rate=24000",
+                mimeType = _latestMimeType.value ?: "audio/L16;codec=pcm;rate=24000",
                 coroutineScope = viewModelScope,
                 onCompletion = {
                     if (_voiceState.value == VoiceState.SPEAKING) {
@@ -544,7 +529,6 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 }
             )
         } else if (text.isNotBlank()) {
-            // Synthesize Gemini real voice on-demand
             viewModelScope.launch {
                 _voiceState.value = VoiceState.PROCESSING
                 val synthesized = geminiService.synthesizeGeminiVoicePublic(
@@ -573,21 +557,13 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    /**
-     * Stop all current playback or recording.
-     */
     fun cancelCurrentOperation() {
-        activeCallJob?.cancel()
-        audioEngine.stopRecording()
-        audioEngine.stopPlayback()
+        interruptAndStop()
         _voiceState.value = VoiceState.IDLE
     }
 
-    /**
-     * Replay a previous voice response from history (synthesizes on-demand if needed).
-     */
     fun replayAudio(item: ChatItem) {
-        audioEngine.stopPlayback()
+        interruptAndStop()
         _currentAiResponse.value = item.text
         if (item.audioBytes != null && item.audioBytes.isNotEmpty()) {
             _voiceState.value = VoiceState.SPEAKING
@@ -595,7 +571,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             _latestMimeType.value = item.mimeType
             audioEngine.playGeminiVoice(
                 audioBytes = item.audioBytes,
-                mimeType = item.mimeType ?: "audio/pcm;rate=24000",
+                mimeType = item.mimeType ?: "audio/L16;codec=pcm;rate=24000",
                 coroutineScope = viewModelScope,
                 onCompletion = {
                     if (_voiceState.value == VoiceState.SPEAKING) {
@@ -645,7 +621,6 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         _currentPersona.value = persona
         prefs.edit().putString("selected_persona", persona.id).apply()
         hapticHelper.click()
-        // If persona has a recommended default voice and user hasn't explicitly locked it, use it
         if (persona.defaultVoice != _selectedVoice.value) {
             setVoice(persona.defaultVoice)
         } else {
@@ -710,6 +685,5 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     override fun onCleared() {
         super.onCleared()
         cancelCurrentOperation()
-        geminiService.liveVoiceClient.close()
     }
 }

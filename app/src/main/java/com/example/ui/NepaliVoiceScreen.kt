@@ -99,6 +99,7 @@ fun NepaliVoiceScreen(
     val isSpeechDetected by viewModel.isSpeechDetected.collectAsState()
     val currentPersona by viewModel.currentPersona.collectAsState()
     val playbackSpeed by viewModel.playbackSpeed.collectAsState()
+    val silenceTimeoutMs by viewModel.silenceTimeoutMs.collectAsState()
 
     var showSettings by remember { mutableStateOf(false) }
     var showPlusDialog by remember { mutableStateOf(false) }
@@ -375,10 +376,7 @@ fun NepaliVoiceScreen(
                         else "सुन्दैछ… बोल्नुहोस् (Listening…)"
                     }
                     VoiceState.PROCESSING -> "सोच्दैछ… (Thinking…)"
-                    VoiceState.SPEAKING -> {
-                        if (isContinuousMode) "नेपालीमा बोल्दैछ… (रोक्न बोल्नुहोस्)"
-                        else "नेपालीमा बोल्दैछ… (Speaking…)"
-                    }
+                    VoiceState.SPEAKING -> "नेपालीमा बोल्दैछ… (रोक्न बोल्नुहोस् वा माइक थिच्नुहोस्)"
                     VoiceState.ERROR -> "त्रुटि (Attention)"
                     VoiceState.IDLE -> {
                         if (isContinuousMode) "अविरल मोड सक्रिय (Continuous Active)"
@@ -653,8 +651,10 @@ fun NepaliVoiceScreen(
             currentVoice = selectedVoice,
             currentApiKey = apiKey,
             currentPersona = currentPersona,
+            silenceTimeoutMs = silenceTimeoutMs,
             onVoiceSelected = { viewModel.setVoice(it) },
             onPersonaSelected = { viewModel.setPersona(it) },
+            onSilenceTimeoutChanged = { viewModel.setSilenceTimeout(it) },
             onApiKeySaved = { viewModel.setApiKey(it) },
             onDismiss = { showSettings = false }
         )

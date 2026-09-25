@@ -75,8 +75,10 @@ fun SettingsDialog(
     currentVoice: String,
     currentApiKey: String,
     currentPersona: NepaliPersona = NepaliPersona.BUDDY,
+    silenceTimeoutMs: Long = 750L,
     onVoiceSelected: (String) -> Unit,
     onPersonaSelected: (NepaliPersona) -> Unit = {},
+    onSilenceTimeoutChanged: (Long) -> Unit = {},
     onApiKeySaved: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -87,6 +89,11 @@ fun SettingsDialog(
         Pair("Aoede", "Polite, Expressive Female"),
         Pair("Fenrir", "Deep, Authoritative Male"),
         Pair("Charon", "Calm, Steady Male")
+    )
+    val latencyOptions = listOf(
+        Pair(600L, "⚡ अति द्रुत (Fastest 600ms)"),
+        Pair(750L, "🚀 सन्तुलित (Normal 750ms)"),
+        Pair(1200L, "🐢 आरामदायी (Relaxed 1200ms)")
     )
 
     Dialog(
@@ -196,6 +203,53 @@ fun SettingsDialog(
                                     modifier = Modifier.size(18.dp)
                                 )
                             }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Voice Response Speed / Silence Timeout
+                Text(
+                    text = "जवाफ आउने गति (Response Latency Speed):",
+                    fontSize = 13.sp,
+                    color = Color(0xFFD8B4FE),
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "बोली रोकिएपछि कति चाँडो AI ले जवाफ दिन थाल्ने:",
+                    fontSize = 11.sp,
+                    color = Color(0xFF9CA3AF)
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    latencyOptions.forEach { (timeout, label) ->
+                        val isSelected = silenceTimeoutMs == timeout
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (isSelected) Color(0xFF3B1869) else Color(0xFF1C143B))
+                                .border(
+                                    1.dp,
+                                    if (isSelected) Color(0xFF38BDF8) else Color(0x336D28D9),
+                                    RoundedCornerShape(10.dp)
+                                )
+                                .clickable { onSilenceTimeoutChanged(timeout) }
+                                .padding(vertical = 8.dp, horizontal = 4.dp)
+                        ) {
+                            Text(
+                                text = label,
+                                fontSize = 10.sp,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                color = if (isSelected) Color(0xFF38BDF8) else Color(0xFFE9D5FF),
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
                         }
                     }
                 }

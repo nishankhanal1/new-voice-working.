@@ -41,7 +41,7 @@ class GeminiLiveVoiceClient(private val okHttpClient: OkHttpClient) {
         private const val LIVE_WS_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private const val LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
-        private const val LIVE_MODEL_FALLBACK = "models/gemini-2.0-flash-exp"
+        private const val LIVE_MODEL_FALLBACK = "models/gemini-2.5-flash-native-audio-preview-12-2025"
     }
 
     private val socketLock = Any()
@@ -158,7 +158,7 @@ class GeminiLiveVoiceClient(private val okHttpClient: OkHttpClient) {
         synchronized(socketLock) {
             activeWebSocket = okHttpClient.newWebSocket(request, listener)
         }
-        return withTimeoutOrNull(1200L) {
+        return withTimeoutOrNull(5000L) {
             setupDeferred.await()
         } ?: false
     }
