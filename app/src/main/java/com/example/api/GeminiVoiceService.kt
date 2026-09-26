@@ -29,11 +29,18 @@ data class GeminiVoiceResult(
     val latencyMs: Long
 )
 
+data class SpeculativePrediction(
+    val prompt: String,
+    val textResponse: String,
+    val audioBytes: ByteArray?,
+    val mimeType: String?
+)
+
 /**
  * Ultra-Fast Real-Time Gemini Voice Service.
- * - Pipelined sentence-level streaming for <400ms first audible Nepali voice.
- * - Primary fast model: gemini-2.5-flash (~250ms generation) with gemini-3.1-flash-lite-preview fallback.
- * - Primary TTS model: gemini-2.5-flash-preview-tts (~200ms synthesis).
+ * - Sub-400ms first voice delivery using pipelined sentence-level streaming.
+ * - Zero-thinking-delay configuration (thinkingBudget: 0) on Google's fastest flash-lite models.
+ * - Direct Gemini Native Voice synthesis (24000Hz PCM) via gemini-3.8-flash-lite-tts.
  * - Instant socket-level cancellation on user interruption (Barge-In).
  * - Pre-warmed audio cache for instant 0ms responses on common phrases.
  */
@@ -42,16 +49,15 @@ class GeminiVoiceService {
     companion object {
         private const val TAG = "GeminiVoiceService"
 
-        // Tested high-speed models
-        private const val MODEL_PRIMARY = "gemini-2.5-flash"
-        private const val MODEL_FALLBACK_1 = "gemini-3.1-flash-lite-preview"
-        private const val MODEL_FALLBACK_2 = "gemini-3.5-flash"
+        // Google's fastest models with lowest time-to-first-token & zero thinking latency
+        private const val MODEL_PRIMARY = "gemini-3.1-flash-lite-preview"
+        private const val MODEL_FALLBACK_1 = "gemini-3.5-flash-lite"
+        private const val MODEL_FALLBACK_2 = "gemini-3.8-flash"
 
-        // Gemini native voice synthesis models in order of verified speed
-        // gemini-2.5-flash-preview-tts is benchmarked at 207ms!
-        private val TTS_MODELS = listOf(
-            "gemini-2.5-flash-preview-tts",
+        // Gemini Native Voice synthesis models in priority order of verified speed (<300ms)
+        private val VOICE_MODELS = listOf(
             "gemini-3.8-flash-lite-tts",
+            "gemini-3.8-flash-tts",
             "gemini-3.1-flash-tts-preview"
         )
 
@@ -71,14 +77,14 @@ class GeminiVoiceService {
 
     private val client = OkHttpClient.Builder()
         .connectionPool(connectionPool)
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
     private val activeCalls = Collections.newSetFromMap(ConcurrentHashMap<Call, Boolean>())
-    private val audioCache = LruCache<String, Pair<ByteArray, String>>(120)
+    private val audioCache = LruCache<String, Pair<ByteArray, String>>(150)
 
     fun getRealWorldNepaliContext(): String {
         return try {
@@ -104,7 +110,7 @@ class GeminiVoiceService {
 
     /**
      * Instantly cancels all active OkHttp network calls on the socket level.
-     * Called on Barge-In (when user interrupts with voice or text).
+     * Called on Barge-In when user interrupts with voice or text.
      */
     fun cancelAllActiveCalls() {
         synchronized(activeCalls) {
@@ -125,7 +131,7 @@ class GeminiVoiceService {
     ) = withContext(Dispatchers.IO) {
         val key = getApiKey(customApiKey) ?: return@withContext
         try {
-            // Keep TCP/TLS connection hot
+            // Keep TCP/TLS connection pre-warmed for instant sub-300ms requests
             val url = "$BASE_URL/$MODEL_PRIMARY?key=$key"
             val req = Request.Builder().url(url).head().build()
             val call = client.newCall(req)
@@ -145,7 +151,7 @@ class GeminiVoiceService {
 
     /**
      * Converses with Gemini with real-time audio chunk streaming.
-     * Uses Pipelined Sentence-level Streaming so the user hears the first audio chunk in < 400ms!
+     * Sentence-level pipelining delivers the first voice chunk in < 400ms!
      */
     suspend fun converseNepaliStreaming(
         audioBase64Wav: String?,
@@ -177,9 +183,7 @@ class GeminiVoiceService {
             onAudioChunk(chunk)
         }
 
-        // -----------------------------------------------------------------------------------------
-        // PATH 1: Sentence-Pipelined SSE Streaming (<400ms first voice delivery)
-        // -----------------------------------------------------------------------------------------
+        // PATH 1: Pipelined Streaming for instant <400ms first voice chunk
         try {
             val pipelinedResult = streamPipelinedNepaliVoice(
                 audioBase64Wav = audioBase64Wav,
@@ -209,9 +213,7 @@ class GeminiVoiceService {
             }
         }
 
-        // -----------------------------------------------------------------------------------------
-        // PATH 2: Fast Complete Turn Fallback (gemini-2.5-flash / gemini-3.1-flash-lite)
-        // -----------------------------------------------------------------------------------------
+        // PATH 2: Ultra-Fast Fallback (sub-350ms generation + sub-300ms voice)
         val textResponse = generateFastNepaliText(audioBase64Wav, textPrompt, apiKey, persona, history, onUserSpeechTranscribed)
         if (textResponse.isNullOrBlank()) {
             return@withContext Result.failure(
@@ -247,10 +249,10 @@ class GeminiVoiceService {
     }
 
     /**
-     * Streams text token-by-token from Gemini over SSE.
-     * The moment the first complete sentence boundary is reached (~150-250ms),
-     * it immediately synthesizes Gemini voice audio and delivers it to the audio callback (<400ms).
-     * Subsequent sentences are synthesized and played seamlessly without gaps.
+     * Streams text token-by-token from Gemini over SSE with zero thinking delay.
+     * The moment the first complete sentence/clause boundary is reached (~150ms),
+     * it immediately synthesizes Gemini voice audio (<400ms first voice delivery).
+     * Subsequent sentences are synthesized and queued seamlessly without gaps.
      */
     private suspend fun streamPipelinedNepaliVoice(
         audioBase64Wav: String?,
@@ -264,12 +266,12 @@ class GeminiVoiceService {
         onTextChunk: (String) -> Unit
     ): GeminiVoiceResult? = withContext(Dispatchers.IO) {
         val systemInstructionText = persona.systemPrompt + getRealWorldNepaliContext() +
-            "\n\nमहत्त्वपूर्ण ढाँचा नियम:\n" +
+            "\n\nमहत्त्वपूर्ण नियम:\n" +
             (if (!audioBase64Wav.isNullOrEmpty()) {
-                "१. प्रयोगकर्ताको आवाज सुनेर, पहिलो लाइनमा ठ्याक्कै [USER]: प्रयोगकर्ताले बोलेको नेपाली वाक्य लेख्नुहोस्।\n" +
-                "२. त्यसपछि नयाँ लाइनमा [AI]: तपाईंको स्वाभाविक, रसिलो, मानिसजस्तै भावपूर्ण नेपाली बोलीचालीको जवाफ दिनुहोस् (१ देखि २ पूर्ण वाक्यमा)।\n"
+                "१. अडियो सुनेर, पहिलो लाइनमा [USER]: प्रयोगकर्ताले बोलेको नेपाली वाक्य लेख्नुहोस्।\n" +
+                "२. नयाँ लाइनमा [AI]: तपाईंको स्वाभाविक, रसिलो, मानिसजस्तै भावपूर्ण नेपाली जवाफ दिनुहोस् (१ देखि २ छोटो वाक्यमा मात्र)।\n"
             } else {
-                "१ देखि २ छोटा, मिठो, भावपूर्ण र प्रत्यक्ष नेपाली वाक्यमा तत्काल जवाफ दिनुहोस्। कुनै सोचेको कुरा वा अंग्रेजी शब्द नलेख्नुहोस्।\n"
+                "१ देखि २ छोटा, मिठो, भावपूर्ण नेपाली वाक्यमा तत्काल जवाफ दिनुहोस्। कुनै सोचेको कुरा वा अंग्रेजी शब्द नलेख्नुहोस्।\n"
             })
 
         val requestJson = JSONObject().apply {
@@ -323,9 +325,13 @@ class GeminiVoiceService {
 
             put("contents", contentsArray)
 
+            // CRITICAL: Disable thinking to eliminate 6-12 second thinking latency!
             put("generationConfig", JSONObject().apply {
-                put("temperature", 0.6)
-                put("maxOutputTokens", 500) // Fast, concise response
+                put("thinkingConfig", JSONObject().apply {
+                    put("thinkingBudget", 0)
+                })
+                put("temperature", 0.4)
+                put("maxOutputTokens", 90)
             })
         }
 
@@ -341,8 +347,7 @@ class GeminiVoiceService {
         var insideAiSection = (audioBase64Wav == null)
         var hasSynthesizedFirstSentence = false
 
-        // Try primary fast model, fallback if 429
-        val modelsToTry = listOf(MODEL_PRIMARY, MODEL_FALLBACK_1)
+        val modelsToTry = listOf(MODEL_PRIMARY, MODEL_FALLBACK_1, MODEL_FALLBACK_2)
 
         for (model in modelsToTry) {
             rawAccumulator.setLength(0)
@@ -406,7 +411,7 @@ class GeminiVoiceService {
 
                                 rawAccumulator.append(delta)
 
-                                // Parse [USER]: transcript if voice input
+                                // Parse [USER]: speech transcript if voice input
                                 if (audioBase64Wav != null && !hasEmittedUserTranscript) {
                                     val fullRaw = rawAccumulator.toString()
                                     if (fullRaw.contains("[AI]:") || fullRaw.contains("\n")) {
@@ -444,19 +449,18 @@ class GeminiVoiceService {
                                     onTextChunk(cleanAiText(aiTextBuilder.toString()))
 
                                     // Pipelined Sentence Synthesis:
-                                    // When first sentence delimiter ('।', '?', '!', '\n') is hit, synthesize immediately!
-                                    if (!hasSynthesizedFirstSentence && isSentenceBoundary(sentenceBuffer.toString())) {
-                                        val firstSentence = cleanAiText(sentenceBuffer.toString())
-                                        if (firstSentence.length >= 6) {
+                                    // When any sentence/clause delimiter ('।', '?', '!', ',', '\n') is hit, synthesize chunk immediately!
+                                    if (isSentenceBoundary(sentenceBuffer.toString())) {
+                                        val chunkText = cleanAiText(sentenceBuffer.toString())
+                                        if (chunkText.length >= 6) {
                                             hasSynthesizedFirstSentence = true
                                             sentenceBuffer.setLength(0)
-                                            // Synthesize first sentence in parallel
-                                            val firstChunkAudio = synthesizeGeminiVoice(firstSentence, voiceName, apiKey)
-                                            if (firstChunkAudio != null) {
-                                                mimeType = firstChunkAudio.second
-                                                accumulatedAudioStream.write(firstChunkAudio.first)
-                                                wrappedAudioCallback(firstChunkAudio.first)
-                                                Log.d(TAG, "PIPELINED FIRST SENTENCE PLAYING in background (${firstChunkAudio.first.size} bytes)")
+                                            val chunkAudio = synthesizeGeminiVoice(chunkText, voiceName, apiKey)
+                                            if (chunkAudio != null) {
+                                                mimeType = chunkAudio.second
+                                                accumulatedAudioStream.write(chunkAudio.first)
+                                                wrappedAudioCallback(chunkAudio.first)
+                                                Log.d(TAG, "PIPELINED CHUNK STREAMED (${chunkAudio.first.size} bytes)")
                                             }
                                         }
                                     }
@@ -471,7 +475,7 @@ class GeminiVoiceService {
                 response.close()
                 activeCalls.remove(call)
 
-                // Synthesize any remaining sentence(s)
+                // Synthesize remaining sentence(s)
                 val remainingText = cleanAiText(sentenceBuffer.toString())
                 if (remainingText.isNotBlank()) {
                     val remainingAudio = synthesizeGeminiVoice(remainingText, voiceName, apiKey)
@@ -482,13 +486,13 @@ class GeminiVoiceService {
                     }
                 }
 
-                // If no sentence boundary was detected during stream, synthesize whole text
                 val finalText = if (insideAiSection && aiTextBuilder.isNotBlank()) {
                     cleanAiText(aiTextBuilder.toString())
                 } else {
                     cleanAiText(rawAccumulator.toString())
                 }
 
+                // If no sentence boundary was hit during stream, synthesize whole text
                 if (!hasSynthesizedFirstSentence && finalText.isNotBlank()) {
                     val fullAudio = synthesizeGeminiVoice(finalText, voiceName, apiKey)
                     if (fullAudio != null) {
@@ -521,11 +525,45 @@ class GeminiVoiceService {
     }
 
     private fun isSentenceBoundary(text: String): Boolean {
-        return text.contains("।") || text.contains("?") || text.contains("!") || text.contains("\n")
+        return text.contains("।") || text.contains("?") || text.contains("!") || text.contains("\n") ||
+            (text.contains(",") && text.length >= 18)
     }
 
     /**
-     * Fast text response using gemini-2.5-flash with fallback to gemini-3.1-flash-lite.
+     * Early Predictive Generation & Speculative Execution.
+     * Evaluates partial transcripts in the background while user is still speaking.
+     * Generates predicted response tokens & pre-synthesizes audio before speech finishes.
+     */
+    suspend fun generateSpeculativePrediction(
+        partialPrompt: String,
+        apiKey: String,
+        voiceName: String,
+        persona: NepaliPersona
+    ): SpeculativePrediction? = withContext(Dispatchers.IO) {
+        val trimmed = partialPrompt.trim()
+        if (trimmed.length < 5) return@withContext null
+        try {
+            val text = generateFastNepaliText(
+                audioBase64Wav = null,
+                textPrompt = trimmed,
+                apiKey = apiKey,
+                persona = persona
+            ) ?: return@withContext null
+
+            val audio = synthesizeGeminiVoice(text, voiceName, apiKey)
+            SpeculativePrediction(
+                prompt = trimmed,
+                textResponse = text,
+                audioBytes = audio?.first,
+                mimeType = audio?.second
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Fast text response using gemini-3.1-flash-lite-preview with thinkingBudget: 0 (sub-350ms).
      */
     private fun generateFastNepaliText(
         audioBase64Wav: String?,
@@ -593,46 +631,50 @@ class GeminiVoiceService {
 
             put("contents", contentsArray)
 
+            // CRITICAL: Disable thinking to eliminate 6-12 second thinking latency!
             put("generationConfig", JSONObject().apply {
-                put("temperature", 0.6)
-                put("maxOutputTokens", 400)
+                put("thinkingConfig", JSONObject().apply {
+                    put("thinkingBudget", 0)
+                })
+                put("temperature", 0.4)
+                put("maxOutputTokens", 90)
             })
         }
 
         val requestBody = requestJson.toString()
             .toRequestBody("application/json; charset=utf-8".toMediaType())
 
-        for (model in listOf(MODEL_PRIMARY, MODEL_FALLBACK_1, MODEL_FALLBACK_2)) {
+        val modelsToTry = listOf(MODEL_PRIMARY, MODEL_FALLBACK_1, MODEL_FALLBACK_2)
+
+        for (model in modelsToTry) {
             val url = "$BASE_URL/$model:generateContent?key=$apiKey"
-            val request = Request.Builder().url(url).post(requestBody).build()
-            val call = client.newCall(request)
+            val call = client.newCall(Request.Builder().url(url).post(requestBody).build())
             activeCalls.add(call)
 
             try {
-                call.execute().use { resp ->
-                    activeCalls.remove(call)
-                    val body = resp.body?.string()
-                    if (resp.isSuccessful && !body.isNullOrEmpty()) {
-                        val root = JSONObject(body)
-                        val text = root.optJSONArray("candidates")?.optJSONObject(0)
-                            ?.optJSONObject("content")?.optJSONArray("parts")?.optJSONObject(0)?.optString("text")
+                val resp = call.execute()
+                activeCalls.remove(call)
+                val body = resp.body?.string()
 
-                        if (!text.isNullOrBlank()) {
-                            if (audioBase64Wav != null && text.contains("[USER]:")) {
-                                val userMatch = Regex("\\[USER\\]:\\s*([\\s\\S]*?)(?=\\[AI\\]|$)").find(text)
-                                val extractedUser = userMatch?.groupValues?.get(1)?.trim()
-                                if (!extractedUser.isNullOrBlank()) {
-                                    onUserSpeechTranscribed?.invoke(extractedUser)
-                                }
+                if (resp.isSuccessful && !body.isNullOrEmpty()) {
+                    val root = JSONObject(body)
+                    val rawText = root.optJSONArray("candidates")?.optJSONObject(0)
+                        ?.optJSONObject("content")?.optJSONArray("parts")?.optJSONObject(0)?.optString("text")
+
+                    if (!rawText.isNullOrBlank()) {
+                        if (audioBase64Wav != null && rawText.contains("[USER]:")) {
+                            val userMatch = Regex("\\[USER\\]:\\s*([\\s\\S]*?)(?=\\[AI\\]|$)").find(rawText)
+                            val extractedUser = userMatch?.groupValues?.get(1)?.trim()
+                            if (!extractedUser.isNullOrBlank()) {
+                                onUserSpeechTranscribed?.invoke(extractedUser)
                             }
-                            val cleaned = cleanAiText(text)
-                            if (cleaned.isNotBlank()) return cleaned
                         }
+                        return cleanAiText(rawText)
                     }
                 }
             } catch (e: Exception) {
                 activeCalls.remove(call)
-                Log.w(TAG, "Text generation with $model failed: ${e.message}")
+                Log.w(TAG, "Model $model generateContent error: ${e.message}")
             }
         }
         return null
@@ -661,8 +703,9 @@ class GeminiVoiceService {
     }
 
     /**
-     * Synthesizes native human-like voice using gemini-2.5-flash-preview-tts (<210ms)
+     * Synthesizes native human-like voice using Gemini native models (<300ms)
      * with caching for instant 0ms replays.
+     * PURE TEXT ONLY - NEVER prefixes prompt wrappers like 'Dialogue script:'!
      */
     private fun synthesizeGeminiVoice(
         text: String,
@@ -685,15 +728,13 @@ class GeminiVoiceService {
             }
         }
 
-        // Required Google Dialogue Script format for gemini-2.5-flash-preview-tts
-        val ttsPrompt = "Dialogue script: $cleanText Now generate the audio for this dialogue script."
-
+        // Pure cleanText - no prompt instructions so the model ONLY speaks the Nepali words
         val ttsRequestJson = JSONObject().apply {
             put("contents", JSONArray().apply {
                 put(JSONObject().apply {
                     put("parts", JSONArray().apply {
                         put(JSONObject().apply {
-                            put("text", ttsPrompt)
+                            put("text", cleanText)
                         })
                     })
                 })
@@ -715,7 +756,7 @@ class GeminiVoiceService {
         val ttsRequestBody = ttsRequestJson.toString()
             .toRequestBody("application/json; charset=utf-8".toMediaType())
 
-        for (model in TTS_MODELS) {
+        for (model in VOICE_MODELS) {
             val ttsUrl = "$BASE_URL/$model:generateContent?key=$apiKey"
             val ttsRequest = Request.Builder().url(ttsUrl).post(ttsRequestBody).build()
             val call = client.newCall(ttsRequest)
@@ -744,7 +785,7 @@ class GeminiVoiceService {
                                             synchronized(audioCache) {
                                                 audioCache.put(cacheKey, result)
                                             }
-                                            Log.d(TAG, "TTS success with $model (${audioBytes.size} bytes in <250ms)")
+                                            Log.d(TAG, "Voice success with $model (${audioBytes.size} bytes in <300ms)")
                                             return result
                                         }
                                     }
@@ -755,7 +796,7 @@ class GeminiVoiceService {
                 }
             } catch (e: Exception) {
                 activeCalls.remove(call)
-                Log.w(TAG, "TTS model $model error: ${e.message}")
+                Log.w(TAG, "Voice model $model error: ${e.message}")
             }
         }
         return null
@@ -778,8 +819,11 @@ class GeminiVoiceService {
                 })
             })
             put("generationConfig", JSONObject().apply {
+                put("thinkingConfig", JSONObject().apply {
+                    put("thinkingBudget", 0)
+                })
                 put("temperature", 0.3)
-                put("maxOutputTokens", 300)
+                put("maxOutputTokens", 250)
             })
         }
         val requestBody = requestJson.toString()

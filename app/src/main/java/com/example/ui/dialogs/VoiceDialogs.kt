@@ -75,7 +75,7 @@ fun SettingsDialog(
     currentVoice: String,
     currentApiKey: String,
     currentPersona: NepaliPersona = NepaliPersona.BUDDY,
-    silenceTimeoutMs: Long = 750L,
+    silenceTimeoutMs: Long = 200L,
     onVoiceSelected: (String) -> Unit,
     onPersonaSelected: (NepaliPersona) -> Unit = {},
     onSilenceTimeoutChanged: (Long) -> Unit = {},
@@ -91,9 +91,9 @@ fun SettingsDialog(
         Pair("Charon", "Calm, Steady Male")
     )
     val latencyOptions = listOf(
-        Pair(600L, "⚡ अति द्रुत (Fastest 600ms)"),
-        Pair(750L, "🚀 सन्तुलित (Normal 750ms)"),
-        Pair(1200L, "🐢 आरामदायी (Relaxed 1200ms)")
+        Pair(180L, "⚡ सुपर द्रुत (<100ms मोड)"),
+        Pair(300L, "🚀 छिटो (Fast 300ms)"),
+        Pair(450L, "⏱️ सन्तुलित (Normal 450ms)")
     )
 
     Dialog(

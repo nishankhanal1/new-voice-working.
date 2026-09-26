@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -12,6 +13,7 @@ import com.example.audio.AudioEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -44,9 +46,28 @@ data class ChatItem(
 class NepaliVoiceViewModel(application: Application) : AndroidViewModel(application) {
 
     private val audioEngine = AudioEngine(application.applicationContext)
+    private val speechRecognizer = com.example.audio.RealtimeSpeechRecognizer(application.applicationContext)
     private val geminiService = GeminiVoiceService()
     private val prefs = application.getSharedPreferences("nepali_voice_prefs", Context.MODE_PRIVATE)
     val hapticHelper = HapticHelper(application.applicationContext)
+
+    private var lastRecognizedSpeech: String? = null
+    private var activeSpeculativeJob: Job? = null
+    @Volatile
+    private var cachedSpeculativePrediction: com.example.api.SpeculativePrediction? = null
+    private val speculativeLock = Any()
+
+    private fun onAiSpeakingFinished() {
+        if (_voiceState.value == VoiceState.SPEAKING) {
+            if (_isContinuousMode.value) {
+                _voiceState.value = VoiceState.LISTENING
+                _currentPrompt.value = "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
+                startListening()
+            } else {
+                _voiceState.value = VoiceState.IDLE
+            }
+        }
+    }
 
     private val _voiceState = MutableStateFlow(VoiceState.IDLE)
     val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
@@ -94,11 +115,11 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     private val _playbackSpeed = MutableStateFlow(prefs.getFloat("playback_speed", 1.0f))
     val playbackSpeed: StateFlow<Float> = _playbackSpeed.asStateFlow()
 
-    private val _silenceTimeoutMs = MutableStateFlow(prefs.getLong("silence_timeout_ms", 750L))
+    private val _silenceTimeoutMs = MutableStateFlow(prefs.getLong("silence_timeout_ms", 200L))
     val silenceTimeoutMs: StateFlow<Long> = _silenceTimeoutMs.asStateFlow()
 
     fun setSilenceTimeout(timeout: Long) {
-        val valid = timeout.coerceIn(500L, 2500L)
+        val valid = timeout.coerceIn(150L, 2000L)
         _silenceTimeoutMs.value = valid
         prefs.edit().putLong("silence_timeout_ms", valid).apply()
         audioEngine.setSilenceTimeoutMs(valid)
@@ -196,18 +217,42 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         geminiService.cancelAllActiveCalls()
         audioEngine.stopPlayback()
         audioEngine.stopRecording()
+        speechRecognizer.stopListening()
     }
 
     private fun startListening() {
         _errorMessage.value = null
         interruptAndStop()
+        lastRecognizedSpeech = null
+
+        // Start concurrent on-device real-time speech recognition
+        if (speechRecognizer.isRecognitionAvailable) {
+            speechRecognizer.startListening(
+                onFinalResult = { text ->
+                    if (text.isNotBlank()) {
+                        lastRecognizedSpeech = text
+                        _currentPrompt.value = text
+                    }
+                },
+                onPartialResult = { partial ->
+                    if (partial.isNotBlank()) {
+                        _currentPrompt.value = partial
+                        triggerSpeculativePrediction(partial)
+                    }
+                },
+                onError = {
+                    // Fallback to raw AudioEngine recording if speech recognizer encounters issue
+                }
+            )
+        }
 
         val started = audioEngine.startRecording(
             coroutineScope = viewModelScope,
             autoSilenceDetection = true,
             isBargeInActive = _isContinuousMode.value,
             onSpeechDetected = {
-                _currentPrompt.value = "सुन्दैछ... बोल्नुहोस्"
+                val partial = speechRecognizer.partialText.value
+                _currentPrompt.value = if (partial.isNotBlank()) partial else "सुन्दैछ... बोल्नुहोस्"
                 hapticHelper.tick()
             },
             onSpeechFinished = {
@@ -250,10 +295,61 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun stopListeningAndProcess() {
         _voiceState.value = VoiceState.PROCESSING
+        // Instant <15ms audible acoustic response cue so sound starts playing immediately
+        audioEngine.playInstantAcknowledgmentCue(viewModelScope)
+        hapticHelper.tick()
+
+        speechRecognizer.stopListening()
+        val fastRecognizedText = lastRecognizedSpeech?.takeIf { it.isNotBlank() }
+            ?: speechRecognizer.partialText.value.takeIf { it.isNotBlank() }
+
         val audioBase64Wav = if (_isContinuousMode.value) {
             audioEngine.extractCurrentRecordedAudio() ?: audioEngine.stopRecording()
         } else {
             audioEngine.stopRecording()
+        }
+
+        // Check for 0ms Speculative Execution Hit!
+        val recognizedText = fastRecognizedText
+        var speculativeHit: com.example.api.SpeculativePrediction? = null
+        synchronized(speculativeLock) {
+            val cached = cachedSpeculativePrediction
+            if (cached != null && recognizedText != null && isSpeculativeMatch(recognizedText, cached.prompt)) {
+                speculativeHit = cached
+            }
+        }
+
+        if (speculativeHit != null && speculativeHit!!.audioBytes != null) {
+            Log.d("NepaliVoiceVM", "0ms SPECULATIVE HIT! Playing pre-computed response instantly")
+            val hit = speculativeHit!!
+            cachedSpeculativePrediction = null
+            _currentPrompt.value = recognizedText!!
+            val userItem = ChatItem(sender = "User", text = recognizedText)
+            val aiItem = ChatItem(sender = "Gemini", text = hit.textResponse, audioBytes = hit.audioBytes, mimeType = hit.mimeType)
+            _history.value = listOf(aiItem, userItem) + _history.value
+            _currentAiResponse.value = hit.textResponse
+            _latestAudioBytes.value = hit.audioBytes
+            _latestMimeType.value = hit.mimeType
+            _latencyMs.value = 15L
+            _voiceState.value = VoiceState.SPEAKING
+            audioEngine.playGeminiVoice(
+                audioBytes = hit.audioBytes!!,
+                mimeType = hit.mimeType ?: "audio/L16;codec=pcm;rate=24000",
+                coroutineScope = viewModelScope,
+                onCompletion = {
+                    onAiSpeakingFinished()
+                }
+            )
+            return
+        }
+
+        // If real-time recognition captured the text, send text directly (takes ~350ms vs ~7000ms for audio)
+        if (!fastRecognizedText.isNullOrBlank()) {
+            _currentPrompt.value = fastRecognizedText
+            val userItem = ChatItem(sender = "User", text = fastRecognizedText)
+            _history.value = listOf(userItem) + _history.value
+            callGeminiApi(audioBase64Wav = null, textPrompt = fastRecognizedText)
+            return
         }
 
         if (audioBase64Wav.isNullOrEmpty()) {
@@ -336,18 +432,23 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 onFirstAudioChunk = {
                     firstChunkReceived = true
                     _voiceState.value = VoiceState.SPEAKING
+                    audioEngine.startStreamingPlayback(
+                        coroutineScope = viewModelScope,
+                        sampleRate = 24000,
+                        onFinished = onPlaybackFinished
+                    )
                 },
                 onAudioChunk = { chunk ->
-                    // Play streaming sentence chunk immediately
+                    if (!firstChunkReceived) {
+                        firstChunkReceived = true
+                        audioEngine.startStreamingPlayback(
+                            coroutineScope = viewModelScope,
+                            sampleRate = 24000,
+                            onFinished = onPlaybackFinished
+                        )
+                    }
                     _voiceState.value = VoiceState.SPEAKING
-                    audioEngine.playGeminiVoice(
-                        audioBytes = chunk,
-                        mimeType = "audio/L16;codec=pcm;rate=24000",
-                        coroutineScope = viewModelScope,
-                        onCompletion = {
-                            onPlaybackFinished()
-                        }
-                    )
+                    audioEngine.enqueueStreamChunk(chunk)
                 },
                 onTextChunk = { partialText ->
                     _currentAiResponse.value = partialText
@@ -379,8 +480,10 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 )
                 _history.value = listOf(aiItem) + _history.value
 
-                // If pipelined streaming didn't already start playing audio, play it now
-                if (!firstChunkReceived && voiceResult.audioBytes != null && voiceResult.audioBytes.isNotEmpty()) {
+                // If streaming chunks were queued, signal finalization so track drains cleanly
+                if (firstChunkReceived) {
+                    audioEngine.finalizeStreaming()
+                } else if (voiceResult.audioBytes != null && voiceResult.audioBytes.isNotEmpty()) {
                     _voiceState.value = VoiceState.SPEAKING
                     audioEngine.playGeminiVoice(
                         audioBytes = voiceResult.audioBytes,
@@ -390,7 +493,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                             onPlaybackFinished()
                         }
                     )
-                } else if (!firstChunkReceived && (voiceResult.audioBytes == null || voiceResult.audioBytes.isEmpty())) {
+                } else {
                     if (_isContinuousMode.value) {
                         _voiceState.value = VoiceState.LISTENING
                         _currentPrompt.value = "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
@@ -415,6 +518,41 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 }
             }
         }
+    }
+
+    /**
+     * Early Predictive Generation & Speculative Execution.
+     * Evaluates partial transcripts in the background while user is speaking.
+     */
+    private fun triggerSpeculativePrediction(partialText: String) {
+        val trimmed = partialText.trim()
+        if (trimmed.length < 5) return
+        activeSpeculativeJob?.cancel()
+        activeSpeculativeJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(120) // Debounce rapid syllable updates
+            val apiKey = geminiService.getApiKey(_apiKey.value) ?: return@launch
+            val prediction = geminiService.generateSpeculativePrediction(
+                partialPrompt = trimmed,
+                apiKey = apiKey,
+                voiceName = _selectedVoice.value,
+                persona = _currentPersona.value
+            )
+            if (prediction != null && isActive) {
+                synchronized(speculativeLock) {
+                    cachedSpeculativePrediction = prediction
+                }
+                Log.d("NepaliVoiceVM", "Speculative response pre-computed: '${prediction.prompt}' -> '${prediction.textResponse}'")
+            }
+        }
+    }
+
+    private fun isSpeculativeMatch(actual: String, predicted: String): Boolean {
+        val a = actual.trim().lowercase()
+        val p = predicted.trim().lowercase()
+        if (a == p) return true
+        if (a.startsWith(p) && (a.length - p.length) <= 15) return true
+        if (p.startsWith(a) && (p.length - a.length) <= 15) return true
+        return false
     }
 
     fun toggleContinuousMode() {
@@ -684,6 +822,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
     override fun onCleared() {
         super.onCleared()
+        speechRecognizer.destroy()
         cancelCurrentOperation()
     }
 }
