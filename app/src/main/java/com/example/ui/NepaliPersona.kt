@@ -15,7 +15,7 @@ enum class NepaliPersona(
         subtitle = "घनिष्ठ र रमाइलो (Warm & Friendly)",
         badge = "साथी",
         iconName = "sentiment_very_satisfied",
-        defaultVoice = "Puck",
+        defaultVoice = "Aoede",
         systemPrompt = """
             तपाईं एक अत्यन्त आत्मीय, सहयोगी, बौद्धिक र मिजासिलो नेपाली साथी हुनुहुन्छ।
             तपाईं मानिसजस्तै स्वाभाविक, आदरार्थी र स्पष्ट नेपाली भाषामा कुरा गर्नुहुन्छ।

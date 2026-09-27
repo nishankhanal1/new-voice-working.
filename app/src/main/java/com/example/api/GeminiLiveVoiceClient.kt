@@ -39,9 +39,9 @@ class GeminiLiveVoiceClient(private val okHttpClient: OkHttpClient) {
     companion object {
         private const val TAG = "GeminiLiveVoiceClient"
         private const val LIVE_WS_URL =
-            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        private const val LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
-        private const val LIVE_MODEL_FALLBACK = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
+        private const val LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
+        private const val LIVE_MODEL_FALLBACK = "models/gemini-2.5-flash"
     }
 
     private val socketLock = Any()
@@ -104,6 +104,18 @@ class GeminiLiveVoiceClient(private val okHttpClient: OkHttpClient) {
                 val setupJson = JSONObject().apply {
                     put("setup", JSONObject().apply {
                         put("model", LIVE_MODEL)
+                        put("generation_config", JSONObject().apply {
+                            put("response_modalities", JSONArray().apply {
+                                put("AUDIO")
+                            })
+                            put("speech_config", JSONObject().apply {
+                                put("voice_config", JSONObject().apply {
+                                    put("prebuilt_voice_config", JSONObject().apply {
+                                        put("voice_name", voiceName)
+                                    })
+                                })
+                            })
+                        })
                         put("generationConfig", JSONObject().apply {
                             put("responseModalities", JSONArray().apply {
                                 put("AUDIO")
@@ -399,10 +411,10 @@ class GeminiLiveVoiceClient(private val okHttpClient: OkHttpClient) {
         try {
             val base64Data = Base64.encodeToString(pcmChunk, Base64.NO_WRAP)
             val msg = JSONObject().apply {
-                put("realtimeInput", JSONObject().apply {
-                    put("mediaChunks", JSONArray().apply {
+                put("realtime_input", JSONObject().apply {
+                    put("media_chunks", JSONArray().apply {
                         put(JSONObject().apply {
-                            put("mimeType", "audio/pcm;rate=$sampleRate")
+                            put("mime_type", "audio/pcm;rate=$sampleRate")
                             put("data", base64Data)
                         })
                     })

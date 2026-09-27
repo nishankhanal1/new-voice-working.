@@ -36,6 +36,8 @@ data class SpeculativePrediction(
     val mimeType: String?
 )
 
+class QuotaExceededException(message: String) : Exception(message)
+
 /**
  * Ultra-Fast Real-Time Gemini Voice Service.
  * - Sub-400ms first voice delivery using pipelined sentence-level streaming.
@@ -54,8 +56,9 @@ class GeminiVoiceService {
         private const val MODEL_FALLBACK_1 = "gemini-3.5-flash-lite"
         private const val MODEL_FALLBACK_2 = "gemini-3.8-flash"
 
-        // Gemini Native Voice synthesis models in priority order of verified speed (<300ms)
+        // Gemini Native Voice models in priority order
         private val VOICE_MODELS = listOf(
+            "gemini-3.1-flash-live-preview",
             "gemini-3.8-flash-lite-tts",
             "gemini-3.8-flash-tts",
             "gemini-3.1-flash-tts-preview"
@@ -140,13 +143,22 @@ class GeminiVoiceService {
     }
 
     fun getApiKey(customApiKey: String?): String? {
-        return customApiKey?.trim()?.takeIf { it.isNotEmpty() }
-            ?: runCatching { BuildConfig.GEMINI_API_KEY }.getOrNull()?.trim()
-                ?.takeIf { it.isNotEmpty() && it != "MY_GEMINI_API_KEY" }
-            ?: runCatching { BuildConfig.INJECTED_GEMINI_API_KEY }.getOrNull()?.trim()
-                ?.takeIf { it.isNotEmpty() && it != "MY_GEMINI_API_KEY" }
-            ?: runCatching { System.getenv("GEMINI_API_KEY") }.getOrNull()?.trim()
-                ?.takeIf { it.isNotEmpty() && it != "MY_GEMINI_API_KEY" }
+        val invalidKeys = setOf("MY_GEMINI_API_KEY", "your_api_key_here", "YOUR_API_KEY", "null", "")
+        fun isValid(key: String?) = !key.isNullOrBlank() && key !in invalidKeys
+
+        val custom = customApiKey?.trim()
+        if (isValid(custom)) return custom
+
+        val buildKey = runCatching { BuildConfig.GEMINI_API_KEY }.getOrNull()?.trim()
+        if (isValid(buildKey)) return buildKey
+
+        val injectedKey = runCatching { BuildConfig.INJECTED_GEMINI_API_KEY }.getOrNull()?.trim()
+        if (isValid(injectedKey)) return injectedKey
+
+        val envKey = runCatching { System.getenv("GEMINI_API_KEY") }.getOrNull()?.trim()
+        if (isValid(envKey)) return envKey
+
+        return null
     }
 
     /**
@@ -204,11 +216,13 @@ class GeminiVoiceService {
             }
         } catch (e: CancellationException) {
             throw e
+        } catch (e: QuotaExceededException) {
+            return@withContext Result.failure(e)
         } catch (e: Exception) {
             Log.w(TAG, "Pipelined streaming exception: ${e.message}")
-            if (e.message?.contains("429") == true || e.message?.contains("RESOURCE_EXHAUSTED") == true) {
+            if (e.message?.contains("429") == true || e.message?.contains("RESOURCE_EXHAUSTED") == true || e.message?.contains("rate limit") == true) {
                 return@withContext Result.failure(
-                    Exception("माफ गर्नुहोस्, हाल Gemini API अनुरोध सीमा (Quota) पुगेको छ। कृपया केही सेकेन्ड पर्खनुहोस् वा Settings ⚙️ मा आफ्नो नि:शुल्क Gemini API Key राख्नुहोस्।")
+                    QuotaExceededException("माफ गर्नुहोस्, हाल Gemini API अनुरोध सीमा (Rate Limit / Quota) पुगेको छ। कृपया केही मिनेटपछि प्रयास गर्नुहोस् वा Settings ⚙️ मा आफ्नो अर्को नि:शुल्क API Key राख्नुहोस्।")
                 )
             }
         }
@@ -368,8 +382,8 @@ class GeminiVoiceService {
                 if (response.code == 429) {
                     activeCalls.remove(call)
                     response.close()
-                    Log.w(TAG, "Model $model returned 429 quota, trying fallback...")
-                    continue
+                    Log.w(TAG, "Model $model returned 429 quota")
+                    throw QuotaExceededException("माफ गर्नुहोस्, हाल Gemini API अनुरोध सीमा (Rate Limit / Quota) पुगेको छ। कृपया केही मिनेटपछि प्रयास गर्नुहोस् वा Settings ⚙️ मा नयाँ Gemini API Key राख्नुहोस्।")
                 }
 
                 if (!response.isSuccessful) {
@@ -654,6 +668,11 @@ class GeminiVoiceService {
             try {
                 val resp = call.execute()
                 activeCalls.remove(call)
+                if (resp.code == 429) {
+                    resp.close()
+                    Log.w(TAG, "Model $model returned 429 quota")
+                    throw QuotaExceededException("माफ गर्नुहोस्, हाल Gemini API अनुरोध सीमा (Rate Limit / Quota) पुगेको छ। कृपया केही मिनेटपछि प्रयास गर्नुहोस् वा Settings ⚙️ मा नयाँ Gemini API Key राख्नुहोस्।")
+                }
                 val body = resp.body?.string()
 
                 if (resp.isSuccessful && !body.isNullOrEmpty()) {
@@ -765,6 +784,10 @@ class GeminiVoiceService {
             try {
                 call.execute().use { ttsResponse ->
                     activeCalls.remove(call)
+                    if (ttsResponse.code == 429) {
+                        Log.w(TAG, "Voice model $model returned 429 quota, halting TTS attempts")
+                        return null
+                    }
                     val ttsBodyString = ttsResponse.body?.string()
 
                     if (ttsResponse.isSuccessful && !ttsBodyString.isNullOrEmpty()) {

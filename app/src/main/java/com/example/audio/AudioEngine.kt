@@ -64,7 +64,7 @@ class AudioEngine(private val context: Context) {
     val isAudioPlaying: StateFlow<Boolean> = _isAudioPlaying.asStateFlow()
 
     private var playbackSpeed: Float = 1.0f
-    private var silenceTimeoutMs: Long = 200L // Ultra-snappy 200ms for <100ms conversational response
+    private var silenceTimeoutMs: Long = 350L // Fine-tuned 350ms (within 300ms–500ms target) for instant end-of-speech detection
 
     fun setSilenceTimeoutMs(timeout: Long) {
         silenceTimeoutMs = timeout.coerceIn(150L, 2000L)
@@ -252,8 +252,10 @@ class AudioEngine(private val context: Context) {
             }
 
             recordingJob = coroutineScope.launch(Dispatchers.IO) {
-                val shortBuffer = ShortArray(chosenBufSize / 2)
-                val byteBuffer = ByteBuffer.allocate(chosenBufSize).order(ByteOrder.LITTLE_ENDIAN)
+                // Requirement 2: Stream in tiny chunks (40ms PCM frame: 640 shorts = 1280 bytes at 16kHz mono)
+                val chunkShorts = if (chosenRate == 16000) 640 else (chosenRate * 40 / 1000)
+                val shortBuffer = ShortArray(chunkShorts)
+                val byteBuffer = ByteBuffer.allocate(chunkShorts * 2).order(ByteOrder.LITTLE_ENDIAN)
                 var hasSpeechStarted = false
                 var speechFramesCount = 0
                 var lastSpeechTimestamp = 0L
@@ -303,12 +305,14 @@ class AudioEngine(private val context: Context) {
                                     recordedPcmStream.write(chunkBytes)
                                 }
                             }
+                            // Directly stream 40ms PCM frame immediately to WebSocket
                             onAudioChunkRecorded?.invoke(chunkBytes, activeRecordSampleRate)
 
-                            // Voice Activity Detection & Instant Barge-In
+                            // Voice Activity Detection & Instant Client-Side Barge-In (Requirement 4)
                             if (rms > dynamicThreshold) {
-                                if (_isAudioPlaying.value && isBargeInActive && rms > dynamicThreshold * 1.25) {
-                                    Log.d(TAG, "Instant Barge-In detected during playback! Interrupting in 0ms...")
+                                if (_isAudioPlaying.value) {
+                                    Log.d(TAG, "Instant Barge-In detected during playback! Immediately pausing and flushing AudioTrack in 0ms...")
+                                    clientSideBargeIn()
                                     stopPlayback()
                                     onBargeIn?.invoke()
                                 }
@@ -517,6 +521,115 @@ class AudioEngine(private val context: Context) {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // DIRECT LIVE AUDIOTRACK STREAMING (Requirement 3 & 4: Instant 24kHz PCM Playback & Barge-In)
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Direct low-latency live streaming AudioTrack for Gemini Live 24kHz PCM chunks.
+     * Uses MODE_STREAM with immediate play and instant barge-in clearing.
+     */
+    fun initDirectLiveAudioTrack(): Boolean {
+        synchronized(playbackLock) {
+            stopPlayback()
+            try {
+                val minBuf = AudioTrack.getMinBufferSize(
+                    GEMINI_PCM_SAMPLE_RATE,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                )
+                val track = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .setFlags(AudioAttributes.FLAG_LOW_LATENCY) // Enable low-latency hardware path
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(GEMINI_PCM_SAMPLE_RATE)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(minBuf)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+
+                track.setVolume(1.0f)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && playbackSpeed != 1.0f) {
+                    try {
+                        track.playbackParams = android.media.PlaybackParams().setSpeed(playbackSpeed)
+                    } catch (_: Exception) {}
+                }
+                track.play()
+                activeAudioTrack = track
+                _isAudioPlaying.value = true
+                ensureAudibleVolume()
+                return true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to initialize direct live AudioTrack: ${e.message}", e)
+                return false
+            }
+        }
+    }
+
+    /**
+     * Requirement 4: Write PCM chunks directly as they arrive over the WebSocket with WRITE_NON_BLOCKING.
+     */
+    fun writeLiveAudioChunk(pcmData: ByteArray) {
+        val track = synchronized(playbackLock) { activeAudioTrack } ?: run {
+            if (initDirectLiveAudioTrack()) {
+                synchronized(playbackLock) { activeAudioTrack }
+            } else null
+        } ?: return
+
+        try {
+            _isAudioPlaying.value = true
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                track.write(pcmData, 0, pcmData.size, AudioTrack.WRITE_NON_BLOCKING)
+            } else {
+                track.write(pcmData, 0, pcmData.size)
+            }
+
+            // Update real-time RMS amplitude for CosmicOrbView
+            val shortsCount = min(pcmData.size / 2, 512)
+            if (shortsCount > 0) {
+                val shortBuf = ShortArray(shortsCount)
+                ByteBuffer.wrap(pcmData, 0, shortsCount * 2)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .asShortBuffer()
+                    .get(shortBuf)
+                var sum = 0.0
+                for (s in shortBuf) sum += s * s
+                val rms = sqrt(sum / shortsCount)
+                _amplitude.value = (rms / 4500.0).coerceIn(0.12, 1.0).toFloat()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "writeLiveAudioChunk error: ${e.message}")
+        }
+    }
+
+    /**
+     * Requirement 6: Instant Client-Side Barge-In.
+     * When the user speaks while the app is still playing previous audio output:
+     * Immediately execute audioTrack.pause() and audioTrack.flush().
+     * Clears streamChunkQueue so no queued audio is played.
+     */
+    fun clientSideBargeIn() {
+        synchronized(playbackLock) {
+            try {
+                activeAudioTrack?.pause()
+                activeAudioTrack?.flush()
+            } catch (_: Exception) {}
+            streamChunkQueue.clear()
+            isStreamFinalized.set(false)
+            _isAudioPlaying.value = false
+            _amplitude.value = 0f
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // CONTINUOUS STREAMING PLAYBACK (Gapless sub-400ms chunk-by-chunk delivery)
     // ---------------------------------------------------------------------------------------------
 
@@ -540,27 +653,32 @@ class AudioEngine(private val context: Context) {
         playbackJob = coroutineScope.launch(Dispatchers.IO) {
             var track: AudioTrack? = null
             try {
-                val minBuf = AudioTrack.getMinBufferSize(
+                // Requirement 5: Minimize Android AudioTrack Hardware Buffering
+                // Configure AudioTrack with absolute minimum system buffer size without multiplying it
+                val minBufferSize = AudioTrack.getMinBufferSize(
                     sampleRate,
                     AudioFormat.CHANNEL_OUT_MONO,
                     AudioFormat.ENCODING_PCM_16BIT
                 )
-                val bufferSize = max(minBuf * 4, 16384)
 
-                track = AudioTrack(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build(),
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build(),
-                    bufferSize,
-                    AudioTrack.MODE_STREAM,
-                    AudioManager.AUDIO_SESSION_ID_GENERATE
-                )
+                track = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .setFlags(AudioAttributes.FLAG_LOW_LATENCY) // Enable low-latency hardware path
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(minBufferSize) // Use exact minBufferSize (do NOT multiply by 2 or 4)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
 
                 synchronized(playbackLock) {
                     activeAudioTrack = track
@@ -787,27 +905,30 @@ class AudioEngine(private val context: Context) {
         onCompletion: () -> Unit
     ) {
         try {
-            val minBuf = AudioTrack.getMinBufferSize(
+            val minBufferSize = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = max(minBuf * 4, 16384)
 
-            val track = AudioTrack(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build(),
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build(),
-                bufferSize,
-                AudioTrack.MODE_STREAM,
-                AudioManager.AUDIO_SESSION_ID_GENERATE
-            )
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .setFlags(AudioAttributes.FLAG_LOW_LATENCY)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBufferSize) // Use exact minBufferSize (do NOT multiply by 2 or 4)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
 
             synchronized(playbackLock) {
                 activeAudioTrack = track
