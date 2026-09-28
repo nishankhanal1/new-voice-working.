@@ -11,6 +11,8 @@ import androidx.lifecycle.viewModelScope
 import com.example.api.GeminiLiveWebSocketClient
 import com.example.api.GeminiVoiceService
 import com.example.audio.AudioEngine
+import com.example.data.ConversationDatabase
+import com.example.data.ConversationRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -49,6 +51,9 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     private val audioEngine = AudioEngine(application.applicationContext)
     private val speechRecognizer = com.example.audio.RealtimeSpeechRecognizer(application.applicationContext)
     private val geminiService = GeminiVoiceService()
+    private val conversationRepo = ConversationRepository(
+        ConversationDatabase.getInstance(application.applicationContext).conversationDao()
+    )
     private val prefs = application.getSharedPreferences("nepali_voice_prefs", Context.MODE_PRIVATE)
     val hapticHelper = HapticHelper(application.applicationContext)
 
@@ -153,6 +158,9 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             )
             _history.value = listOf(aiItem) + _history.value
             _currentAiResponse.value = text
+            viewModelScope.launch {
+                conversationRepo.addMessage("model", text)
+            }
         }
         if (audioBytes.isNotEmpty()) {
             _latestAudioBytes.value = audioBytes
@@ -214,7 +222,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     private val _playbackSpeed = MutableStateFlow(prefs.getFloat("playback_speed", 1.0f))
     val playbackSpeed: StateFlow<Float> = _playbackSpeed.asStateFlow()
 
-    private val _silenceTimeoutMs = MutableStateFlow(prefs.getLong("silence_timeout_ms", 350L))
+    private val _silenceTimeoutMs = MutableStateFlow(prefs.getLong("silence_timeout_ms", 200L).coerceIn(150L, 500L))
     val silenceTimeoutMs: StateFlow<Long> = _silenceTimeoutMs.asStateFlow()
 
     fun setSilenceTimeout(timeout: Long) {
@@ -253,6 +261,22 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     init {
         audioEngine.setPlaybackSpeed(_playbackSpeed.value)
         audioEngine.setSilenceTimeoutMs(_silenceTimeoutMs.value)
+        viewModelScope.launch {
+            conversationRepo.allMessages.collect { entities ->
+                if (entities.isNotEmpty()) {
+                    val items = entities.reversed().map { entity ->
+                        ChatItem(
+                            id = entity.id.toString(),
+                            sender = if (entity.role == "user") "User" else "Gemini",
+                            text = entity.text,
+                            timestamp = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date(entity.timestamp)),
+                            isBookmarked = entity.isBookmarked
+                        )
+                    }
+                    _history.value = items
+                }
+            }
+        }
         viewModelScope.launch {
             val key = geminiService.getApiKey(_apiKey.value)
             if (!key.isNullOrBlank()) {
@@ -377,10 +401,10 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 }
             },
             onAudioChunkRecorded = { chunkBytes, _ ->
-                // Requirement 2: Stream Audio in Tiny Chunks (20ms–40ms PCM)
-                // Format: Raw PCM, 16kHz sample rate, 1 channel (mono), 16-bit LE
-                // Send PCM data frames directly to WebSocket as soon as captured
-                liveWebSocketClient?.sendRealtimeAudioChunk(chunkBytes)
+                // Requirement 4: Temporarily pause streaming microphone chunks to Gemini until the model finishes its audio response
+                if (_voiceState.value == VoiceState.LISTENING) {
+                    liveWebSocketClient?.sendRealtimeAudioChunk(chunkBytes)
+                }
             }
         )
 
@@ -421,89 +445,31 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         val fastRecognizedText = lastRecognizedSpeech?.takeIf { it.isNotBlank() }
             ?: speechRecognizer.partialText.value.takeIf { it.isNotBlank() }
 
+        // FASTEST PATH (<350ms): If real-time recognition captured text, NEVER wait or send raw audio WAV!
+        if (!fastRecognizedText.isNullOrBlank()) {
+            _currentPrompt.value = fastRecognizedText
+            val userItem = ChatItem(sender = "User", text = fastRecognizedText)
+            _history.value = listOf(userItem) + _history.value
+            viewModelScope.launch {
+                conversationRepo.addMessage("user", fastRecognizedText)
+            }
+            callGeminiApi(audioBase64Wav = null, textPrompt = fastRecognizedText)
+            return
+        }
+
+        // SLOW PATH FALLBACK: If speech recognizer had no text, extract recorded audio
         val audioBase64Wav = if (_isContinuousMode.value) {
             audioEngine.extractCurrentRecordedAudio() ?: audioEngine.stopRecording()
         } else {
             audioEngine.stopRecording()
         }
 
-        // Live WebSocket Mode (gemini-3.1-flash-live-preview)
-        if (liveWebSocketClient?.isReady() == true) {
-            liveTurnStartTime = System.currentTimeMillis()
-            liveFirstChunkReceived = false
-            hasLiveChunksEmittedInTurn = false
-            liveWebSocketClient?.sendTurnComplete()
-
-            if (!fastRecognizedText.isNullOrBlank()) {
-                _currentPrompt.value = fastRecognizedText
-                val userItem = ChatItem(sender = "User", text = fastRecognizedText)
-                _history.value = listOf(userItem) + _history.value
-            } else {
-                _currentPrompt.value = "तपाईंको आवाज विश्लेषण गर्दै..."
-            }
-
-            // Watchdog fallback: if live model doesn't stream audio in 3.5s, seamlessly fall back to REST pipeline
-            activeCallJob?.cancel()
-            activeCallJob = viewModelScope.launch {
-                delay(3500)
-                if (_voiceState.value == VoiceState.PROCESSING && !hasLiveChunksEmittedInTurn) {
-                    Log.d("NepaliVoiceVM", "Live WebSocket turnaround timeout, falling back to REST pipeline")
-                    callGeminiApi(audioBase64Wav = audioBase64Wav, textPrompt = fastRecognizedText)
-                }
-            }
-            return
-        }
-
-        // Check for 0ms Speculative Execution Hit!
-        val recognizedText = fastRecognizedText
-        var speculativeHit: com.example.api.SpeculativePrediction? = null
-        synchronized(speculativeLock) {
-            val cached = cachedSpeculativePrediction
-            if (cached != null && recognizedText != null && isSpeculativeMatch(recognizedText, cached.prompt)) {
-                speculativeHit = cached
-            }
-        }
-
-        if (speculativeHit != null && speculativeHit!!.audioBytes != null) {
-            Log.d("NepaliVoiceVM", "0ms SPECULATIVE HIT! Playing pre-computed response instantly")
-            val hit = speculativeHit!!
-            cachedSpeculativePrediction = null
-            _currentPrompt.value = recognizedText!!
-            val userItem = ChatItem(sender = "User", text = recognizedText)
-            val aiItem = ChatItem(sender = "Gemini", text = hit.textResponse, audioBytes = hit.audioBytes, mimeType = hit.mimeType)
-            _history.value = listOf(aiItem, userItem) + _history.value
-            _currentAiResponse.value = hit.textResponse
-            _latestAudioBytes.value = hit.audioBytes
-            _latestMimeType.value = hit.mimeType
-            _latencyMs.value = 15L
-            _voiceState.value = VoiceState.SPEAKING
-            audioEngine.playGeminiVoice(
-                audioBytes = hit.audioBytes!!,
-                mimeType = hit.mimeType ?: "audio/L16;codec=pcm;rate=24000",
-                coroutineScope = viewModelScope,
-                onCompletion = {
-                    onAiSpeakingFinished()
-                }
-            )
-            return
-        }
-
-        // If real-time recognition captured the text, send text directly (takes ~350ms vs ~7000ms for audio)
-        if (!fastRecognizedText.isNullOrBlank()) {
-            _currentPrompt.value = fastRecognizedText
-            val userItem = ChatItem(sender = "User", text = fastRecognizedText)
-            _history.value = listOf(userItem) + _history.value
-            callGeminiApi(audioBase64Wav = null, textPrompt = fastRecognizedText)
-            return
-        }
-
         if (audioBase64Wav.isNullOrEmpty()) {
             if (_isContinuousMode.value) {
                 _voiceState.value = VoiceState.LISTENING
-                _currentPrompt.value = "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
+                startListening()
             } else {
                 _voiceState.value = VoiceState.IDLE
-                _currentPrompt.value = "कुनै आवाज सुनिएन। फेरि बोल्नुहोस्।"
             }
             return
         }
@@ -528,6 +494,9 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
         val userItem = ChatItem(sender = "User", text = text)
         _history.value = listOf(userItem) + _history.value
+        viewModelScope.launch {
+            conversationRepo.addMessage("user", text)
+        }
 
         callGeminiApi(audioBase64Wav = null, textPrompt = text)
     }
@@ -573,6 +542,9 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                     _currentPrompt.value = recognizedUserSpeech
                     val userItem = ChatItem(sender = "User", text = recognizedUserSpeech)
                     _history.value = listOf(userItem) + _history.value
+                    viewModelScope.launch {
+                        conversationRepo.addMessage("user", recognizedUserSpeech)
+                    }
                 },
                 onFirstAudioChunk = {
                     firstChunkReceived = true
@@ -624,6 +596,9 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                     mimeType = voiceResult.mimeType
                 )
                 _history.value = listOf(aiItem) + _history.value
+                viewModelScope.launch {
+                    conversationRepo.addMessage("model", voiceResult.textResponse)
+                }
 
                 // If streaming chunks were queued, signal finalization so track drains cleanly
                 if (firstChunkReceived) {
@@ -737,6 +712,10 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             )
         )
         _currentAiResponse.value = "नमस्ते! म तपाईंलाई कसरी सहयोग गर्न सक्छु?"
+        viewModelScope.launch {
+            conversationRepo.clearHistory()
+        }
+        hapticHelper.click()
     }
 
     private var testPromptIndex = 0
@@ -928,6 +907,14 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun toggleBookmark(itemId: String) {
+        val longId = itemId.toLongOrNull()
+        if (longId != null) {
+            val current = _history.value.find { it.id == itemId }
+            val newBookmarked = !(current?.isBookmarked ?: false)
+            viewModelScope.launch {
+                conversationRepo.toggleBookmark(longId, newBookmarked)
+            }
+        }
         _history.value = _history.value.map { item ->
             if (item.id == itemId) {
                 item.copy(isBookmarked = !item.isBookmarked)
@@ -985,6 +972,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     override fun onCleared() {
         super.onCleared()
         speechRecognizer.destroy()
+        audioEngine.release()
         liveWebSocketClient?.disconnect()
         liveWebSocketClient = null
         cancelCurrentOperation()

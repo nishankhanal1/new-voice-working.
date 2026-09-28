@@ -34,9 +34,9 @@ class GeminiLiveWebSocketClient(
 ) {
     companion object {
         private const val TAG = "GeminiLiveWebSocket"
-        const val WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
-        const val LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
-        const val LIVE_MODEL_FALLBACK = "models/gemini-2.5-flash"
+        const val WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        const val LIVE_MODEL = "models/gemini-2.0-flash-exp"
+        const val LIVE_MODEL_FALLBACK = "models/gemini-2.0-flash"
     }
 
     private val client = OkHttpClient.Builder()
@@ -50,10 +50,12 @@ class GeminiLiveWebSocketClient(
     private val isConnected = AtomicBoolean(false)
     private val isSetupDone = AtomicBoolean(false)
     private var usingFallbackModel = false
+    private var lastConnectedCallback: (() -> Unit)? = null
 
     fun isReady(): Boolean = isConnected.get() && isSetupDone.get()
 
     fun connect(onConnected: () -> Unit) {
+        lastConnectedCallback = onConnected
         val url = "$WS_URL?key=$apiKey"
         val request = Request.Builder().url(url).build()
 
@@ -62,7 +64,6 @@ class GeminiLiveWebSocketClient(
                 Log.d(TAG, "Gemini Live WebSocket opened (code: ${response.code}). Sending setup frame...")
                 isConnected.set(true)
                 sendSetupMessage(if (usingFallbackModel) LIVE_MODEL_FALLBACK else LIVE_MODEL)
-                onConnected()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -89,6 +90,12 @@ class GeminiLiveWebSocketClient(
                 Log.w(TAG, "Gemini Live WebSocket failure: ${t.message}")
                 isConnected.set(false)
                 isSetupDone.set(false)
+                if (!usingFallbackModel) {
+                    usingFallbackModel = true
+                    Log.d(TAG, "Retrying WebSocket with fallback model: $LIVE_MODEL_FALLBACK")
+                    connect(onConnected)
+                    return
+                }
                 onError(t.message ?: "WebSocket connection failed")
             }
         })
@@ -96,7 +103,7 @@ class GeminiLiveWebSocketClient(
 
     /**
      * Requirement 4: Initial setup configuration when opening the WebSocket session
-     * to request AUDIO modality natively, model gemini-3.1-flash-live-preview, and voice config.
+     * to request AUDIO modality natively, model gemini-2.5-flash-native-audio-preview-12-2025, and voice config.
      */
     private fun sendSetupMessage(modelName: String) {
         try {
@@ -107,19 +114,19 @@ class GeminiLiveWebSocketClient(
             val setupJson = JSONObject().apply {
                 put("setup", JSONObject().apply {
                     put("model", modelName)
-                    put("generation_config", JSONObject().apply {
-                        put("response_modalities", JSONArray().apply {
+                    put("generationConfig", JSONObject().apply {
+                        put("responseModalities", JSONArray().apply {
                             put("AUDIO")
                         })
-                        put("speech_config", JSONObject().apply {
-                            put("voice_config", JSONObject().apply {
-                                put("prebuilt_voice_config", JSONObject().apply {
-                                    put("voice_name", voiceName)
+                        put("speechConfig", JSONObject().apply {
+                            put("voiceConfig", JSONObject().apply {
+                                put("prebuiltVoiceConfig", JSONObject().apply {
+                                    put("voiceName", voiceName)
                                 })
                             })
                         })
                     })
-                    put("system_instruction", JSONObject().apply {
+                    put("systemInstruction", JSONObject().apply {
                         put("parts", JSONArray().apply {
                             put(JSONObject().apply {
                                 put("text", systemPromptNepali)
@@ -129,8 +136,7 @@ class GeminiLiveWebSocketClient(
                 })
             }
             webSocket?.send(setupJson.toString())
-            isSetupDone.set(true)
-            Log.d(TAG, "Gemini Live setup message sent with model: $modelName and AUDIO modality")
+            Log.d(TAG, "Gemini Live setup message sent with model: $modelName and AUDIO modality (awaiting setupComplete)")
         } catch (e: Exception) {
             Log.e(TAG, "Error sending WebSocket setup", e)
         }
@@ -140,13 +146,22 @@ class GeminiLiveWebSocketClient(
      * Requirement 4: Stream Micro Audio Chunks (20ms – 40ms)
      * Format: Raw PCM, 16kHz sample rate, 1 channel (mono), 16-bit LE.
      * Frame Size: 40ms PCM chunks (1,280 bytes at 16kHz, 16-bit mono).
-     * Directly sends realtime_input to WebSocket as base64 data as soon as captured.
+     * Directly sends realtimeInput to WebSocket as base64 data as soon as captured.
      */
     fun sendRealtimeAudioChunk(pcmChunk: ByteArray) {
         if (!isConnected.get() || !isSetupDone.get()) return
         try {
             val base64Pcm = Base64.encodeToString(pcmChunk, Base64.NO_WRAP)
-            val jsonPayload = """{"realtime_input":{"media_chunks":[{"mime_type":"audio/pcm;rate=16000","data":"$base64Pcm"}]}}"""
+            val jsonPayload = JSONObject().apply {
+                put("realtimeInput", JSONObject().apply {
+                    put("mediaChunks", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("mimeType", "audio/pcm;rate=16000")
+                            put("data", base64Pcm)
+                        })
+                    })
+                })
+            }.toString()
             webSocket?.send(jsonPayload)
         } catch (e: Exception) {
             Log.w(TAG, "Error streaming PCM chunk to WebSocket: ${e.message}")
@@ -157,17 +172,43 @@ class GeminiLiveWebSocketClient(
      * Requirement 1: Manual End-of-Turn without waiting for server VAD silence timeout.
      * Instantly notifies the server to end the turn when the user finishes speaking or releases mic:
      * {
-     *   "client_content": {
-     *     "turn_complete": true
+     *   "clientContent": {
+     *     "turnComplete": true
      *   }
      * }
      */
     fun sendTurnComplete() {
+        sendTurnCompleteWithText(null)
+    }
+
+    fun sendTurnCompleteWithText(userText: String? = null) {
         if (!isConnected.get()) return
         try {
-            val jsonPayload = """{"client_content":{"turn_complete":true}}"""
+            val jsonPayload = if (!userText.isNullOrBlank()) {
+                JSONObject().apply {
+                    put("clientContent", JSONObject().apply {
+                        put("turns", JSONArray().apply {
+                            put(JSONObject().apply {
+                                put("role", "user")
+                                put("parts", JSONArray().apply {
+                                    put(JSONObject().apply {
+                                        put("text", userText)
+                                    })
+                                })
+                            })
+                        })
+                        put("turnComplete", true)
+                    })
+                }.toString()
+            } else {
+                JSONObject().apply {
+                    put("clientContent", JSONObject().apply {
+                        put("turnComplete", true)
+                    })
+                }.toString()
+            }
             webSocket?.send(jsonPayload)
-            Log.d(TAG, "Sent client_content turn_complete frame")
+            Log.d(TAG, "Sent clientContent turnComplete frame (with text: ${!userText.isNullOrBlank()})")
         } catch (e: Exception) {
             Log.w(TAG, "Error sending turnComplete: ${e.message}")
         }
@@ -180,7 +221,11 @@ class GeminiLiveWebSocketClient(
     fun interrupt() {
         if (!isConnected.get()) return
         try {
-            val jsonPayload = """{"client_content":{"turn_complete":true}}"""
+            val jsonPayload = JSONObject().apply {
+                put("clientContent", JSONObject().apply {
+                    put("turnComplete", true)
+                })
+            }.toString()
             webSocket?.send(jsonPayload)
             Log.d(TAG, "Sent client-side barge-in interrupt frame")
         } catch (_: Exception) {}
@@ -213,6 +258,17 @@ class GeminiLiveWebSocketClient(
             if (root.has("setupComplete") || root.has("setup_complete")) {
                 Log.d(TAG, "Gemini Live setup complete confirmed by server")
                 isSetupDone.set(true)
+                lastConnectedCallback?.invoke()
+                return
+            }
+
+            // Server error payload
+            if (root.has("error")) {
+                val errMsg = root.optJSONObject("error")?.optString("message") ?: "Server error"
+                Log.w(TAG, "Gemini Live server returned error: $errMsg")
+                isConnected.set(false)
+                isSetupDone.set(false)
+                onError(errMsg)
                 return
             }
 

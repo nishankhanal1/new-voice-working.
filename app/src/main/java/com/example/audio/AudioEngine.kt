@@ -10,6 +10,8 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.util.Base64
 import android.util.Log
@@ -64,7 +66,10 @@ class AudioEngine(private val context: Context) {
     val isAudioPlaying: StateFlow<Boolean> = _isAudioPlaying.asStateFlow()
 
     private var playbackSpeed: Float = 1.0f
-    private var silenceTimeoutMs: Long = 350L // Fine-tuned 350ms (within 300ms–500ms target) for instant end-of-speech detection
+    private var silenceTimeoutMs: Long = 200L // 200ms for instant turn completion
+
+    // Real-time Silero VAD powered by ONNX Runtime
+    private val sileroVad by lazy { SileroVadDetector(context) }
 
     fun setSilenceTimeoutMs(timeout: Long) {
         silenceTimeoutMs = timeout.coerceIn(150L, 2000L)
@@ -251,21 +256,40 @@ class AudioEngine(private val context: Context) {
                 return false
             }
 
+            // Attach hardware AcousticEchoCanceler and NoiseSuppressor if supported
+            var echoCanceler: AcousticEchoCanceler? = null
+            var noiseSuppressor: NoiseSuppressor? = null
+            try {
+                if (AcousticEchoCanceler.isAvailable()) {
+                    echoCanceler = AcousticEchoCanceler.create(chosenRecord.audioSessionId)?.apply {
+                        enabled = true
+                    }
+                    Log.d(TAG, "Hardware AcousticEchoCanceler enabled on session ${chosenRecord.audioSessionId}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not enable AEC: ${e.message}")
+            }
+            try {
+                if (NoiseSuppressor.isAvailable()) {
+                    noiseSuppressor = NoiseSuppressor.create(chosenRecord.audioSessionId)?.apply {
+                        enabled = true
+                    }
+                    Log.d(TAG, "Hardware NoiseSuppressor enabled on session ${chosenRecord.audioSessionId}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not enable NS: ${e.message}")
+            }
+
             recordingJob = coroutineScope.launch(Dispatchers.IO) {
                 // Requirement 2: Stream in tiny chunks (40ms PCM frame: 640 shorts = 1280 bytes at 16kHz mono)
                 val chunkShorts = if (chosenRate == 16000) 640 else (chosenRate * 40 / 1000)
                 val shortBuffer = ShortArray(chunkShorts)
                 val byteBuffer = ByteBuffer.allocate(chunkShorts * 2).order(ByteOrder.LITTLE_ENDIAN)
+                sileroVad.reset()
                 var hasSpeechStarted = false
-                var speechFramesCount = 0
-                var lastSpeechTimestamp = 0L
+                var silenceStartTime = 0L
                 val recordingStartTimestamp = System.currentTimeMillis()
                 var hasTriggeredFinish = false
-
-                // Adaptive noise floor & AGC
-                var noiseFloorSum = 0.0
-                var noiseFloorFrames = 0
-                var dynamicThreshold = 18.0
 
                 try {
                     while (isActive && isRecording) {
@@ -273,29 +297,8 @@ class AudioEngine(private val context: Context) {
                         val readShorts = rec.read(shortBuffer, 0, shortBuffer.size)
                         if (readShorts > 0) {
                             byteBuffer.clear()
-                            var sumSquared = 0.0
-                            var maxShort = 0
-
                             for (i in 0 until readShorts) {
-                                val sample = shortBuffer[i]
-                                byteBuffer.putShort(sample)
-                                sumSquared += sample * sample
-                                val absSample = abs(sample.toInt())
-                                if (absSample > maxShort) maxShort = absSample
-                            }
-
-                            val rms = sqrt(sumSquared / readShorts)
-                            val normalizedAmp = (rms / 4000.0).coerceIn(0.0, 1.0).toFloat()
-                            _amplitude.value = normalizedAmp
-
-                            val now = System.currentTimeMillis()
-
-                            // Initial noise floor calibration
-                            if (noiseFloorFrames < 5) {
-                                noiseFloorSum += rms
-                                noiseFloorFrames++
-                                val avgNoise = noiseFloorSum / noiseFloorFrames
-                                dynamicThreshold = (avgNoise * 1.3).coerceIn(12.0, 45.0)
+                                byteBuffer.putShort(shortBuffer[i])
                             }
 
                             // Buffer audio into PCM stream
@@ -305,48 +308,61 @@ class AudioEngine(private val context: Context) {
                                     recordedPcmStream.write(chunkBytes)
                                 }
                             }
-                            // Directly stream 40ms PCM frame immediately to WebSocket
+                            // Directly stream PCM frame to callback (e.g. WebSocket)
                             onAudioChunkRecorded?.invoke(chunkBytes, activeRecordSampleRate)
 
-                            // Voice Activity Detection & Instant Client-Side Barge-In (Requirement 4)
-                            if (rms > dynamicThreshold) {
-                                if (_isAudioPlaying.value) {
-                                    Log.d(TAG, "Instant Barge-In detected during playback! Immediately pausing and flushing AudioTrack in 0ms...")
-                                    clientSideBargeIn()
-                                    stopPlayback()
-                                    onBargeIn?.invoke()
-                                }
-                                speechFramesCount++
-                                lastSpeechTimestamp = now
-                                if (speechFramesCount >= 2 && !hasSpeechStarted) {
-                                    hasSpeechStarted = true
-                                    _isSpeechDetected.value = true
-                                    onSpeechDetected?.invoke()
-                                }
-                            }
+                            // Real-time Silero VAD (ONNX Runtime)
+                            sileroVad.processPcmBytes(chunkBytes) { speechProbability ->
+                                val now = System.currentTimeMillis()
 
-                            // Auto-trigger completion on silence after speech
-                            if (autoSilenceDetection && hasSpeechStarted && !hasTriggeredFinish) {
-                                val silenceDuration = now - lastSpeechTimestamp
-                                val speechDuration = now - recordingStartTimestamp
-                                if (silenceDuration > silenceTimeoutMs && speechDuration >= 250L) {
-                                    hasTriggeredFinish = true
-                                    _isSpeechDetected.value = false
-                                    Log.d(TAG, "Natural end of speech detected (${silenceDuration}ms pause).")
-                                    onSpeechFinished?.invoke()
+                                // Speech probability used for real-time visualization
+                                _amplitude.value = speechProbability
 
-                                    if (isBargeInActive) {
-                                        hasSpeechStarted = false
-                                        speechFramesCount = 0
-                                        lastSpeechTimestamp = 0L
-                                        hasTriggeredFinish = false
-                                    } else {
-                                        break
+                                if (speechProbability > 0.5f) {
+                                    // Active speech detected (speechProbability > 0.5f)
+                                    silenceStartTime = 0L // Reset silence timer
+
+                                    // Instant Client-Side Barge-In during playback
+                                    if (_isAudioPlaying.value) {
+                                        Log.d(TAG, "Silero VAD: Barge-In detected (prob=$speechProbability). Silencing playback...")
+                                        clientSideBargeIn()
+                                        stopPlayback()
+                                        onBargeIn?.invoke()
+                                    }
+
+                                    if (!hasSpeechStarted) {
+                                        hasSpeechStarted = true
+                                        _isSpeechDetected.value = true
+                                        onSpeechDetected?.invoke()
+                                    }
+                                } else if (speechProbability < 0.3f) {
+                                    // Silence window detected (speechProbability < 0.3f)
+                                    if (hasSpeechStarted && !hasTriggeredFinish) {
+                                        if (silenceStartTime == 0L) {
+                                            silenceStartTime = now
+                                        }
+                                        val silenceDuration = now - silenceStartTime
+                                        val speechDuration = now - recordingStartTimestamp
+
+                                        // Instant Turn Completion: As soon as continuous silence reaches timeout after speech, trigger immediately!
+                                        if (autoSilenceDetection && silenceDuration >= silenceTimeoutMs && speechDuration >= 120L) {
+                                            hasTriggeredFinish = true
+                                            _isSpeechDetected.value = false
+                                            Log.d(TAG, "Silero VAD: End of speech detected (${silenceDuration}ms silence). Triggering turn completion!")
+                                            onSpeechFinished?.invoke()
+
+                                            if (isBargeInActive) {
+                                                hasSpeechStarted = false
+                                                silenceStartTime = 0L
+                                                hasTriggeredFinish = false
+                                            }
+                                        }
                                     }
                                 }
                             }
 
                             // 45s safety ceiling
+                            val now = System.currentTimeMillis()
                             if (hasSpeechStarted && !hasTriggeredFinish && (now - recordingStartTimestamp > 45000L)) {
                                 hasTriggeredFinish = true
                                 _isSpeechDetected.value = false
@@ -362,6 +378,12 @@ class AudioEngine(private val context: Context) {
                     Log.e(TAG, "Error in audio recording loop", e)
                 } finally {
                     _isSpeechDetected.value = false
+                    try {
+                        echoCanceler?.release()
+                    } catch (_: Exception) {}
+                    try {
+                        noiseSuppressor?.release()
+                    } catch (_: Exception) {}
                     synchronized(recordingLock) {
                         try {
                             chosenRecord.stop()
@@ -661,7 +683,7 @@ class AudioEngine(private val context: Context) {
                     AudioFormat.ENCODING_PCM_16BIT
                 )
 
-                track = AudioTrack.Builder()
+                val trackBuilder = AudioTrack.Builder()
                     .setAudioAttributes(
                         AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -678,7 +700,12 @@ class AudioEngine(private val context: Context) {
                     )
                     .setBufferSizeInBytes(minBufferSize) // Use exact minBufferSize (do NOT multiply by 2 or 4)
                     .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                }
+
+                track = trackBuilder.build()
 
                 synchronized(playbackLock) {
                     activeAudioTrack = track
@@ -1191,5 +1218,14 @@ class AudioEngine(private val context: Context) {
         System.arraycopy(header, 0, wavData, 0, 44)
         System.arraycopy(pcmData, 0, wavData, 44, pcmData.size)
         return wavData
+    }
+
+    /**
+     * Releases audio hardware and ONNX Silero VAD resources.
+     */
+    fun release() {
+        stopRecording()
+        stopPlayback()
+        sileroVad.release()
     }
 }

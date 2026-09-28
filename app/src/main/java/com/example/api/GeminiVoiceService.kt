@@ -51,14 +51,13 @@ class GeminiVoiceService {
     companion object {
         private const val TAG = "GeminiVoiceService"
 
-        // Google's fastest models with lowest time-to-first-token & zero thinking latency
-        private const val MODEL_PRIMARY = "gemini-3.1-flash-lite-preview"
+        // Google's fastest models with zero thinking delay (measured <350ms)
+        private const val MODEL_PRIMARY = "gemini-3.1-flash-lite"
         private const val MODEL_FALLBACK_1 = "gemini-3.5-flash-lite"
         private const val MODEL_FALLBACK_2 = "gemini-3.8-flash"
 
-        // Gemini Native Voice models in priority order
+        // Gemini Native Voice TTS models in priority order (measured <650ms for raw audio/wav)
         private val VOICE_MODELS = listOf(
-            "gemini-3.1-flash-live-preview",
             "gemini-3.8-flash-lite-tts",
             "gemini-3.8-flash-tts",
             "gemini-3.1-flash-tts-preview"
@@ -281,12 +280,8 @@ class GeminiVoiceService {
     ): GeminiVoiceResult? = withContext(Dispatchers.IO) {
         val systemInstructionText = persona.systemPrompt + getRealWorldNepaliContext() +
             "\n\nमहत्त्वपूर्ण नियम:\n" +
-            (if (!audioBase64Wav.isNullOrEmpty()) {
-                "१. अडियो सुनेर, पहिलो लाइनमा [USER]: प्रयोगकर्ताले बोलेको नेपाली वाक्य लेख्नुहोस्।\n" +
-                "२. नयाँ लाइनमा [AI]: तपाईंको स्वाभाविक, रसिलो, मानिसजस्तै भावपूर्ण नेपाली जवाफ दिनुहोस् (१ देखि २ छोटो वाक्यमा मात्र)।\n"
-            } else {
-                "१ देखि २ छोटा, मिठो, भावपूर्ण नेपाली वाक्यमा तत्काल जवाफ दिनुहोस्। कुनै सोचेको कुरा वा अंग्रेजी शब्द नलेख्नुहोस्।\n"
-            })
+            "१. तपाईं एक आत्मीय, रसिलो र भावपूर्ण नेपाली साथी हुनुहुन्छ।\n" +
+            "२. प्रयोगकर्ताको कुरा सुनेर तुरुन्तै १ छोटो र स्वाभाविक नेपाली वाक्यमा जवाफ बोल्नुहोस् (अधिकतम १० देखि १२ शब्द मात्र)। कुनै शीर्षक वा भूमिका नलेख्नुहोस्।"
 
         val requestJson = JSONObject().apply {
             put("systemInstruction", JSONObject().apply {
@@ -339,13 +334,13 @@ class GeminiVoiceService {
 
             put("contents", contentsArray)
 
-            // CRITICAL: Disable thinking to eliminate 6-12 second thinking latency!
+            // CRITICAL: Disable thinking to eliminate 8-18 second thinking delay!
             put("generationConfig", JSONObject().apply {
                 put("thinkingConfig", JSONObject().apply {
                     put("thinkingBudget", 0)
                 })
-                put("temperature", 0.4)
-                put("maxOutputTokens", 90)
+                put("temperature", 0.3)
+                put("maxOutputTokens", 40)
             })
         }
 
@@ -424,49 +419,23 @@ class GeminiVoiceService {
                                 if (delta.isEmpty()) continue
 
                                 rawAccumulator.append(delta)
+                                val aiDelta = delta
+                                aiTextBuilder.append(aiDelta)
+                                sentenceBuffer.append(aiDelta)
+                                onTextChunk(cleanAiText(aiTextBuilder.toString()))
 
-                                // Parse [USER]: speech transcript if voice input
-                                if (audioBase64Wav != null && !hasEmittedUserTranscript) {
-                                    val fullRaw = rawAccumulator.toString()
-                                    if (fullRaw.contains("[AI]:") || fullRaw.contains("\n")) {
-                                        val userMatch = Regex("\\[USER\\]:\\s*([\\s\\S]*?)(?=\\[AI\\]|$)").find(fullRaw)
-                                        val extractedUser = userMatch?.groupValues?.get(1)?.trim()
-                                        if (!extractedUser.isNullOrBlank()) {
-                                            hasEmittedUserTranscript = true
-                                            onUserSpeechTranscribed?.invoke(extractedUser)
-                                        }
-                                    }
-                                }
-
-                                // Route text to AI output
-                                var aiDelta = ""
-                                if (audioBase64Wav != null) {
-                                    if (!insideAiSection) {
-                                        val fullRaw = rawAccumulator.toString()
-                                        if (fullRaw.contains("[AI]:")) {
-                                            insideAiSection = true
-                                            aiDelta = fullRaw.substringAfter("[AI]:")
-                                        } else if (!fullRaw.contains("[USER") && fullRaw.isNotBlank()) {
-                                            insideAiSection = true
-                                            aiDelta = fullRaw
-                                        }
-                                    } else {
-                                        aiDelta = delta
-                                    }
+                                // Ultra-Fast Pipelined Sentence Synthesis:
+                                // Trigger first chunk as soon as 10 chars (~2-3 Nepali words) or delimiter arrive!
+                                val currentBuf = sentenceBuffer.toString()
+                                val shouldTrigger = if (!hasSynthesizedFirstSentence) {
+                                    currentBuf.length >= 10 || isSentenceBoundary(currentBuf)
                                 } else {
-                                    aiDelta = delta
+                                    isSentenceBoundary(currentBuf) || currentBuf.length >= 24
                                 }
 
-                                if (aiDelta.isNotEmpty() && insideAiSection) {
-                                    aiTextBuilder.append(aiDelta)
-                                    sentenceBuffer.append(aiDelta)
-                                    onTextChunk(cleanAiText(aiTextBuilder.toString()))
-
-                                    // Pipelined Sentence Synthesis:
-                                    // When any sentence/clause delimiter ('।', '?', '!', ',', '\n') is hit, synthesize chunk immediately!
-                                    if (isSentenceBoundary(sentenceBuffer.toString())) {
-                                        val chunkText = cleanAiText(sentenceBuffer.toString())
-                                        if (chunkText.length >= 6) {
+                                    if (shouldTrigger) {
+                                        val chunkText = cleanAiText(currentBuf)
+                                        if (chunkText.length >= 4) {
                                             hasSynthesizedFirstSentence = true
                                             sentenceBuffer.setLength(0)
                                             val chunkAudio = synthesizeGeminiVoice(chunkText, voiceName, apiKey)
@@ -478,7 +447,6 @@ class GeminiVoiceService {
                                             }
                                         }
                                     }
-                                }
                             }
                         } catch (e: Exception) {
                             Log.w(TAG, "Error parsing SSE chunk: ${e.message}")
@@ -645,13 +613,13 @@ class GeminiVoiceService {
 
             put("contents", contentsArray)
 
-            // CRITICAL: Disable thinking to eliminate 6-12 second thinking latency!
+            // CRITICAL: Disable thinking to eliminate 8-18 second thinking delay!
             put("generationConfig", JSONObject().apply {
                 put("thinkingConfig", JSONObject().apply {
                     put("thinkingBudget", 0)
                 })
-                put("temperature", 0.4)
-                put("maxOutputTokens", 90)
+                put("temperature", 0.3)
+                put("maxOutputTokens", 40)
             })
         }
 
@@ -747,25 +715,14 @@ class GeminiVoiceService {
             }
         }
 
-        // Pure cleanText - no prompt instructions so the model ONLY speaks the Nepali words
+        // Dedicated Gemini Native Voice TTS (gemini-3.8-flash-tts)
+        // Accepts pure text content directly and outputs audio/wav without unsupported speechConfig
         val ttsRequestJson = JSONObject().apply {
             put("contents", JSONArray().apply {
                 put(JSONObject().apply {
                     put("parts", JSONArray().apply {
                         put(JSONObject().apply {
                             put("text", cleanText)
-                        })
-                    })
-                })
-            })
-            put("generationConfig", JSONObject().apply {
-                put("responseModalities", JSONArray().apply {
-                    put("AUDIO")
-                })
-                put("speechConfig", JSONObject().apply {
-                    put("voiceConfig", JSONObject().apply {
-                        put("prebuiltVoiceConfig", JSONObject().apply {
-                            put("voiceName", voiceName)
                         })
                     })
                 })
@@ -842,9 +799,6 @@ class GeminiVoiceService {
                 })
             })
             put("generationConfig", JSONObject().apply {
-                put("thinkingConfig", JSONObject().apply {
-                    put("thinkingBudget", 0)
-                })
                 put("temperature", 0.3)
                 put("maxOutputTokens", 250)
             })

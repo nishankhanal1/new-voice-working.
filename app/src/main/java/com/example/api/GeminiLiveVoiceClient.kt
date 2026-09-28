@@ -39,8 +39,8 @@ class GeminiLiveVoiceClient(private val okHttpClient: OkHttpClient) {
     companion object {
         private const val TAG = "GeminiLiveVoiceClient"
         private const val LIVE_WS_URL =
-            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
-        private const val LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        private const val LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
         private const val LIVE_MODEL_FALLBACK = "models/gemini-2.5-flash"
     }
 

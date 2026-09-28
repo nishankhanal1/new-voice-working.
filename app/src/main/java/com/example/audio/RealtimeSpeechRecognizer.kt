@@ -120,11 +120,15 @@ class RealtimeSpeechRecognizer(private val context: Context) {
                 val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                     putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
                     // Primary language Nepali with Hindi / English fallbacks
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ne-NP")
                     putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("ne", "hi-IN", "en-US"))
+                    putExtra("android.speech.extras.SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS", 180L)
+                    putExtra("android.speech.extras.SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS", 120L)
+                    putExtra("android.speech.extras.SPEECH_INPUT_MINIMUM_LENGTH_MILLIS", 80L)
                 }
 
                 speechRecognizer?.startListening(intent)
