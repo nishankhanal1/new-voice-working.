@@ -34,35 +34,51 @@ class GeminiLiveWebSocketClient(
 ) {
     companion object {
         private const val TAG = "GeminiLiveWebSocket"
-        const val WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        const val LIVE_MODEL = "models/gemini-2.0-flash-exp"
-        const val LIVE_MODEL_FALLBACK = "models/gemini-2.0-flash"
+        const val WS_URL_ALPHA = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
+        const val WS_URL_BETA = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        const val LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+        const val LIVE_MODEL_FALLBACK = "models/gemini-2.5-flash"
     }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .pingInterval(15, TimeUnit.SECONDS) // Requirement 7: Keep-alive ping frame every 15s to keep WebSocket connection warm
+        .pingInterval(10, TimeUnit.SECONDS) // Lightweight ping frame every 10s to keep TCP/TLS socket warm and prevent timeout
         .readTimeout(0, TimeUnit.MILLISECONDS) // Keep-alive for continuous duplex streaming
         .writeTimeout(10, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private var webSocket: WebSocket? = null
     private val isConnected = AtomicBoolean(false)
     private val isSetupDone = AtomicBoolean(false)
+    private val isConnecting = AtomicBoolean(false)
     private var usingFallbackModel = false
+    private var usingBetaEndpoint = false
     private var lastConnectedCallback: (() -> Unit)? = null
 
     fun isReady(): Boolean = isConnected.get() && isSetupDone.get()
+    fun isConnected(): Boolean = isConnected.get()
 
     fun connect(onConnected: () -> Unit) {
         lastConnectedCallback = onConnected
-        val url = "$WS_URL?key=$apiKey"
+        if (isReady()) {
+            onConnected()
+            return
+        }
+        if (isConnecting.get()) {
+            return
+        }
+        isConnecting.set(true)
+
+        val baseUrl = if (usingBetaEndpoint) WS_URL_BETA else WS_URL_ALPHA
+        val url = "$baseUrl?key=$apiKey"
         val request = Request.Builder().url(url).build()
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "Gemini Live WebSocket opened (code: ${response.code}). Sending setup frame...")
                 isConnected.set(true)
+                isConnecting.set(false)
                 sendSetupMessage(if (usingFallbackModel) LIVE_MODEL_FALLBACK else LIVE_MODEL)
             }
 
@@ -78,24 +94,36 @@ class GeminiLiveWebSocketClient(
                 Log.d(TAG, "Gemini Live WebSocket closing: $code / $reason")
                 isConnected.set(false)
                 isSetupDone.set(false)
+                isConnecting.set(false)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "Gemini Live WebSocket closed: $code / $reason")
                 isConnected.set(false)
                 isSetupDone.set(false)
+                isConnecting.set(false)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.w(TAG, "Gemini Live WebSocket failure: ${t.message}")
+                Log.w(TAG, "Gemini Live WebSocket failure: ${t.message} (code: ${response?.code})")
                 isConnected.set(false)
                 isSetupDone.set(false)
+                isConnecting.set(false)
+
+                if (!usingBetaEndpoint) {
+                    usingBetaEndpoint = true
+                    Log.d(TAG, "Retrying WebSocket with v1beta endpoint...")
+                    connect(onConnected)
+                    return
+                }
+
                 if (!usingFallbackModel) {
                     usingFallbackModel = true
                     Log.d(TAG, "Retrying WebSocket with fallback model: $LIVE_MODEL_FALLBACK")
                     connect(onConnected)
                     return
                 }
+
                 onError(t.message ?: "WebSocket connection failed")
             }
         })
@@ -107,9 +135,7 @@ class GeminiLiveWebSocketClient(
      */
     private fun sendSetupMessage(modelName: String) {
         try {
-            val systemPromptNepali = persona.systemPrompt +
-                "\n\nतपाईं एक अत्यन्त जीवन्त, आत्मीय, रसिलो र भावपूर्ण नेपाली साथी हुनुहुन्छ।" +
-                "\nनियम: १ देखि २ छोटा, मिठो, भावपूर्ण नेपाली वाक्यमा स्वाभाविक जवाफ दिनुहोस्।"
+            val systemPromptNepali = persona.systemPrompt
 
             val setupJson = JSONObject().apply {
                 put("setup", JSONObject().apply {
@@ -232,12 +258,36 @@ class GeminiLiveWebSocketClient(
     }
 
     /**
-     * Requirement 7: Keep-alive ping frame to maintain active warm socket connection.
+     * Requirement 2: Keep-alive ping frame to maintain active warm socket connection.
+     * Prevents TCP/TLS renegotiation lag before user begins speaking.
      */
     fun sendKeepAlivePing() {
         if (!isConnected.get()) return
         try {
             webSocket?.send(okio.ByteString.EMPTY)
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Sends a minimal 20ms silence PCM chunk (640 bytes of zeros) to keep the Gemini Live
+     * audio pipeline active in warm state during background idling without triggering speech detection.
+     */
+    fun sendWarmSilenceFrame() {
+        if (!isConnected.get() || !isSetupDone.get()) return
+        try {
+            val silence20ms = ByteArray(640)
+            val base64Silence = Base64.encodeToString(silence20ms, Base64.NO_WRAP)
+            val jsonPayload = JSONObject().apply {
+                put("realtimeInput", JSONObject().apply {
+                    put("mediaChunks", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("mimeType", "audio/pcm;rate=16000")
+                            put("data", base64Silence)
+                        })
+                    })
+                })
+            }.toString()
+            webSocket?.send(jsonPayload)
         } catch (_: Exception) {}
     }
 
@@ -247,6 +297,7 @@ class GeminiLiveWebSocketClient(
             webSocket = null
             isConnected.set(false)
             isSetupDone.set(false)
+            isConnecting.set(false)
         } catch (_: Exception) {}
     }
 

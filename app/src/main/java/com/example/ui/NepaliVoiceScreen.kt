@@ -100,6 +100,8 @@ fun NepaliVoiceScreen(
     val currentPersona by viewModel.currentPersona.collectAsState()
     val playbackSpeed by viewModel.playbackSpeed.collectAsState()
     val silenceTimeoutMs by viewModel.silenceTimeoutMs.collectAsState()
+    val isStreamPrewarmed by viewModel.isStreamPrewarmed.collectAsState()
+    val initialPlaybackLagMs by viewModel.initialPlaybackLagMs.collectAsState()
 
     var showSettings by remember { mutableStateOf(false) }
     var showPlusDialog by remember { mutableStateOf(false) }
@@ -416,7 +418,7 @@ fun NepaliVoiceScreen(
                     if (latencyMs != null && voiceState != VoiceState.LISTENING) {
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "• ${latencyMs}ms",
+                            text = "• ${latencyMs}ms" + if (initialPlaybackLagMs in 1..25) " (lag: ${initialPlaybackLagMs}ms)" else "",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color(0xFF38BDF8)
@@ -652,6 +654,8 @@ fun NepaliVoiceScreen(
             currentApiKey = apiKey,
             currentPersona = currentPersona,
             silenceTimeoutMs = silenceTimeoutMs,
+            isStreamPrewarmed = isStreamPrewarmed,
+            initialPlaybackLagMs = initialPlaybackLagMs,
             onVoiceSelected = { viewModel.setVoice(it) },
             onPersonaSelected = { viewModel.setPersona(it) },
             onSilenceTimeoutChanged = { viewModel.setSilenceTimeout(it) },

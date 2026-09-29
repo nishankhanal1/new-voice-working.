@@ -20,7 +20,7 @@ abstract class ConversationDatabase : RoomDatabase() {
                     context.applicationContext,
                     ConversationDatabase::class.java,
                     "nepali_voice_conversation.db"
-                ).fallbackToDestructiveMigration().build()
+                ).fallbackToDestructiveMigration(dropAllTables = true).build()
                 INSTANCE = instance
                 instance
             }

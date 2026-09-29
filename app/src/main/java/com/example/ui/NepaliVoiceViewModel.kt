@@ -83,8 +83,57 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    // Multi-key pool for free tier quota rotation
+    private var currentKeyIndex = 0
+    @Volatile
+    private var lastUserActivityTimestamp = System.currentTimeMillis()
+
+    private fun getAvailableApiKeys(): List<String> {
+        val userEntered = _apiKey.value.trim()
+        val customKeys = if (userEntered.isNotBlank()) {
+            userEntered.split(",", ";", "\n", " ")
+                .map { it.trim() }
+                .filter { it.isNotBlank() && it.length > 10 }
+        } else {
+            emptyList()
+        }
+        val envKeys = listOfNotNull(
+            runCatching { BuildConfig.GEMINI_API_KEY }.getOrNull()?.trim(),
+            runCatching { BuildConfig.INJECTED_GEMINI_API_KEY }.getOrNull()?.trim(),
+            runCatching { System.getenv("GEMINI_API_KEY") }.getOrNull()?.trim()
+        ).filter { it.isNotBlank() && !it.startsWith("MY_") && !it.startsWith("your_") }
+
+        val combined = (customKeys + envKeys).distinct()
+        return if (combined.isNotEmpty()) combined else listOfNotNull(geminiService.getApiKey(userEntered))
+    }
+
+    private fun getActiveApiKey(): String? {
+        val keys = getAvailableApiKeys()
+        if (keys.isEmpty()) return null
+        val idx = currentKeyIndex % keys.size
+        return keys[idx]
+    }
+
+    private fun rotateToNextApiKey(reason: String) {
+        val keys = getAvailableApiKeys()
+        if (keys.size <= 1) {
+            Log.w("NepaliVoiceVM", "Cannot rotate API key: only ${keys.size} key available ($reason)")
+            return
+        }
+        currentKeyIndex = (currentKeyIndex + 1) % keys.size
+        val nextKey = keys[currentKeyIndex]
+        val masked = if (nextKey.length > 8) "${nextKey.take(4)}...${nextKey.takeLast(4)}" else "***"
+        Log.i("NepaliVoiceVM", "Rate-limit/Quota encountered ($reason). Instantly rotating to key pool index #$currentKeyIndex ($masked)")
+        liveWebSocketClient?.disconnect()
+        liveWebSocketClient = null
+        viewModelScope.launch {
+            geminiService.prewarm(nextKey, _selectedVoice.value, _currentPersona.value, viewModelScope)
+            ensureLiveClientConnected()
+        }
+    }
+
     private fun ensureLiveClientConnected() {
-        val key = geminiService.getApiKey(_apiKey.value) ?: return
+        val key = getActiveApiKey() ?: return
         if (liveWebSocketClient != null && liveWebSocketClient!!.isReady()) {
             return
         }
@@ -94,6 +143,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             voiceName = _selectedVoice.value,
             persona = _currentPersona.value,
             onAudioChunkReceived = { pcmChunk ->
+                lastUserActivityTimestamp = System.currentTimeMillis()
                 // Requirement 3: Instant Playback via AudioTrack Streaming (MODE_STREAM)
                 hasLiveChunksEmittedInTurn = true
                 viewModelScope.launch(Dispatchers.Main) {
@@ -111,6 +161,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 audioEngine.writeLiveAudioChunk(pcmChunk)
             },
             onTextChunkReceived = { textChunk ->
+                lastUserActivityTimestamp = System.currentTimeMillis()
                 viewModelScope.launch(Dispatchers.Main) {
                     liveTextAccumulator.append(textChunk)
                     val fullText = liveTextAccumulator.toString().trim()
@@ -120,18 +171,29 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 }
             },
             onInterrupted = {
+                lastUserActivityTimestamp = System.currentTimeMillis()
                 // Server-side VAD interruption detection
                 viewModelScope.launch(Dispatchers.Main) {
                     onBargeInTriggered()
                 }
             },
             onTurnComplete = {
+                lastUserActivityTimestamp = System.currentTimeMillis()
                 viewModelScope.launch(Dispatchers.Main) {
                     onLiveTurnFinished()
                 }
             },
             onError = { err ->
                 Log.w("NepaliVoiceVM", "Gemini Live WebSocket notice: $err")
+                val isQuotaErr = err.contains("quota", ignoreCase = true) ||
+                    err.contains("429") ||
+                    err.contains("resource_exhausted", ignoreCase = true) ||
+                    err.contains("limit", ignoreCase = true)
+                if (isQuotaErr) {
+                    viewModelScope.launch(Dispatchers.Main) {
+                        rotateToNextApiKey("WebSocket 429 quota error: $err")
+                    }
+                }
             }
         ).also { client ->
             client.connect {
@@ -167,12 +229,16 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             _latestMimeType.value = "audio/pcm;rate=24000"
         }
 
-        if (_isContinuousMode.value) {
-            _voiceState.value = VoiceState.LISTENING
-            _currentPrompt.value = "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
-            startListening()
-        } else {
-            _voiceState.value = VoiceState.IDLE
+        audioEngine.drainLiveAudioTrack(viewModelScope) {
+            if (_voiceState.value == VoiceState.SPEAKING) {
+                if (_isContinuousMode.value) {
+                    _voiceState.value = VoiceState.LISTENING
+                    _currentPrompt.value = "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
+                    startListening()
+                } else {
+                    _voiceState.value = VoiceState.IDLE
+                }
+            }
         }
     }
 
@@ -206,6 +272,8 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         .stateIn(viewModelScope, SharingStarted.Lazily, false)
 
     val isAudioPlaying: StateFlow<Boolean> = audioEngine.isAudioPlaying
+    val isStreamPrewarmed: StateFlow<Boolean> = audioEngine.isStreamPrewarmed
+    val initialPlaybackLagMs: StateFlow<Long> = audioEngine.initialPlaybackLagMs
 
     private val _latestAudioBytes = MutableStateFlow<ByteArray?>(null)
     val latestAudioBytes: StateFlow<ByteArray?> = _latestAudioBytes.asStateFlow()
@@ -222,7 +290,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     private val _playbackSpeed = MutableStateFlow(prefs.getFloat("playback_speed", 1.0f))
     val playbackSpeed: StateFlow<Float> = _playbackSpeed.asStateFlow()
 
-    private val _silenceTimeoutMs = MutableStateFlow(prefs.getLong("silence_timeout_ms", 200L).coerceIn(150L, 500L))
+    private val _silenceTimeoutMs = MutableStateFlow(prefs.getLong("silence_timeout_ms", 220L).coerceIn(150L, 1000L))
     val silenceTimeoutMs: StateFlow<Long> = _silenceTimeoutMs.asStateFlow()
 
     fun setSilenceTimeout(timeout: Long) {
@@ -261,6 +329,8 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
     init {
         audioEngine.setPlaybackSpeed(_playbackSpeed.value)
         audioEngine.setSilenceTimeoutMs(_silenceTimeoutMs.value)
+        // Pre-warm AudioTrack stream buffer ahead of time to eliminate initial playback lag
+        audioEngine.prewarmAudioStreamBuffer(viewModelScope)
         viewModelScope.launch {
             conversationRepo.allMessages.collect { entities ->
                 if (entities.isNotEmpty()) {
@@ -282,6 +352,33 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             if (!key.isNullOrBlank()) {
                 ensureLiveClientConnected()
                 geminiService.prewarm(key, _selectedVoice.value, _currentPersona.value, viewModelScope)
+            }
+        }
+        // Requirement 2 & 3: Smart Idle Management
+        // - Closes the WebSocket session if idle for >35 seconds to avoid consuming keep-alive tokens on free quotas.
+        // - Reconnects instantly when mic or conversation activity resumes.
+        viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(8000L)
+                val idleDuration = System.currentTimeMillis() - lastUserActivityTimestamp
+                if (_voiceState.value == VoiceState.IDLE) {
+                    val client = liveWebSocketClient
+                    if (idleDuration > 35000L) {
+                        // User inactive >35 seconds: disconnect socket to preserve free quota tokens
+                        if (client != null && client.isConnected()) {
+                            Log.d("NepaliVoiceVM", "Smart Idle: Inactive for ${idleDuration / 1000}s. Closing WebSocket to preserve free quota.")
+                            client.disconnect()
+                            liveWebSocketClient = null
+                        }
+                    } else {
+                        // Active session: keep connection warm
+                        if (client != null && client.isReady()) {
+                            client.sendKeepAlivePing()
+                        } else if (client == null || !client.isConnected()) {
+                            ensureLiveClientConnected()
+                        }
+                    }
+                }
             }
         }
     }
@@ -410,6 +507,8 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
 
         if (started) {
             _voiceState.value = VoiceState.LISTENING
+            // Pre-warm audio stream buffer so sound output is instantaneous
+            audioEngine.prewarmAudioStreamBuffer(viewModelScope)
             _currentPrompt.value = if (_isContinuousMode.value) {
                 "अविरल कुराकानी सुन्दैछ... बोल्नुहोस्"
             } else {
@@ -445,7 +544,35 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
         val fastRecognizedText = lastRecognizedSpeech?.takeIf { it.isNotBlank() }
             ?: speechRecognizer.partialText.value.takeIf { it.isNotBlank() }
 
-        // FASTEST PATH (<350ms): If real-time recognition captured text, NEVER wait or send raw audio WAV!
+        // ULTRA-FAST PATH (Full-Duplex Gemini Live WebSocket):
+        // Audio has already been streamed in real-time 40ms chunks to the WebSocket!
+        if (liveWebSocketClient != null && liveWebSocketClient!!.isReady()) {
+            liveTurnStartTime = System.currentTimeMillis()
+            liveFirstChunkReceived = false
+            hasLiveChunksEmittedInTurn = false
+            synchronized(liveAudioAccumulator) { liveAudioAccumulator.reset() }
+            liveTextAccumulator.setLength(0)
+
+            audioEngine.prewarmAudioStreamBuffer(viewModelScope)
+            audioEngine.initDirectLiveAudioTrack()
+            audioEngine.stopRecording()
+
+            if (!fastRecognizedText.isNullOrBlank()) {
+                _currentPrompt.value = fastRecognizedText
+                val userItem = ChatItem(sender = "User", text = fastRecognizedText)
+                _history.value = listOf(userItem) + _history.value
+                viewModelScope.launch {
+                    conversationRepo.addMessage("user", fastRecognizedText)
+                }
+                liveWebSocketClient?.sendTurnCompleteWithText(fastRecognizedText)
+            } else {
+                _currentPrompt.value = "तपाईंको आवाज विश्लेषण गर्दै..."
+                liveWebSocketClient?.sendTurnComplete()
+            }
+            return
+        }
+
+        // FASTEST REST PATH (<350ms): If real-time recognition captured text, NEVER wait or send raw audio WAV!
         if (!fastRecognizedText.isNullOrBlank()) {
             _currentPrompt.value = fastRecognizedText
             val userItem = ChatItem(sender = "User", text = fastRecognizedText)
@@ -457,7 +584,7 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             return
         }
 
-        // SLOW PATH FALLBACK: If speech recognizer had no text, extract recorded audio
+        // REST PATH FALLBACK: If speech recognizer had no text, extract recorded audio
         val audioBase64Wav = if (_isContinuousMode.value) {
             audioEngine.extractCurrentRecordedAudio() ?: audioEngine.stopRecording()
         } else {
@@ -498,19 +625,33 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             conversationRepo.addMessage("user", text)
         }
 
-        callGeminiApi(audioBase64Wav = null, textPrompt = text)
+        audioEngine.prewarmAudioStreamBuffer(viewModelScope)
+        if (liveWebSocketClient != null && liveWebSocketClient!!.isReady()) {
+            liveTurnStartTime = System.currentTimeMillis()
+            liveFirstChunkReceived = false
+            hasLiveChunksEmittedInTurn = false
+            synchronized(liveAudioAccumulator) { liveAudioAccumulator.reset() }
+            liveTextAccumulator.setLength(0)
+            audioEngine.initDirectLiveAudioTrack()
+            liveWebSocketClient?.sendTurnCompleteWithText(text)
+        } else {
+            callGeminiApi(audioBase64Wav = null, textPrompt = text)
+        }
     }
 
     private fun callGeminiApi(audioBase64Wav: String?, textPrompt: String?) {
         activeCallJob?.cancel()
+        audioEngine.prewarmAudioStreamBuffer(viewModelScope)
         activeCallJob = viewModelScope.launch {
+            // Requirement 1: Limit conversation context window to last 2-3 turns (max 4 history items)
+            // Drastically reduces tokens per turn to stay well beneath free TPM / RPM rate limits
             val allHistoryReversed = _history.value.reversed()
             val priorItems = if (textPrompt != null && allHistoryReversed.lastOrNull()?.text == textPrompt) {
                 allHistoryReversed.dropLast(1)
             } else {
                 allHistoryReversed
             }
-            val historyPairs = priorItems.takeLast(6).map { item ->
+            val historyPairs = priorItems.takeLast(4).map { item ->
                 val role = if (item.sender == "User") "user" else "model"
                 Pair(role, item.text)
             }
@@ -530,11 +671,12 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
             var userTranscribedEmitted = false
             var firstChunkReceived = false
 
+            val activeKey = getActiveApiKey()
             val result = geminiService.converseNepaliStreaming(
                 audioBase64Wav = audioBase64Wav,
                 textPrompt = textPrompt,
                 voiceName = _selectedVoice.value,
-                customApiKey = _apiKey.value.takeIf { it.isNotBlank() },
+                customApiKey = activeKey,
                 persona = _currentPersona.value,
                 history = historyPairs,
                 onUserSpeechTranscribed = { recognizedUserSpeech ->
@@ -626,16 +768,20 @@ class NepaliVoiceViewModel(application: Application) : AndroidViewModel(applicat
                 audioEngine.stopPlayback()
                 _voiceState.value = VoiceState.ERROR
                 _errorMessage.value = error.message ?: "त्रुटि भयो। कृपया फेरि प्रयास गर्नुहोस्।"
+                val isQuotaError = error is com.example.api.QuotaExceededException ||
+                    error.message?.contains("Quota", ignoreCase = true) == true ||
+                    error.message?.contains("429") == true ||
+                    error.message?.contains("Rate Limit", ignoreCase = true) == true ||
+                    error.message?.contains("resource_exhausted", ignoreCase = true) == true
+                if (isQuotaError) {
+                    rotateToNextApiKey("HTTP 429 quota error")
+                }
                 if (_isContinuousMode.value) {
-                    val isQuotaError = error is com.example.api.QuotaExceededException ||
-                        error.message?.contains("Quota") == true ||
-                        error.message?.contains("429") == true ||
-                        error.message?.contains("Rate Limit") == true
-                    if (isQuotaError) {
+                    if (isQuotaError && getAvailableApiKeys().size <= 1) {
                         _isContinuousMode.value = false
                     } else {
                         viewModelScope.launch {
-                            delay(2000)
+                            delay(1200)
                             if (_isContinuousMode.value && _voiceState.value == VoiceState.ERROR) {
                                 _voiceState.value = VoiceState.IDLE
                                 _errorMessage.value = null

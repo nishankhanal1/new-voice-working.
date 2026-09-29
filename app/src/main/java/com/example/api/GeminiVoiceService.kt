@@ -52,15 +52,14 @@ class GeminiVoiceService {
         private const val TAG = "GeminiVoiceService"
 
         // Google's fastest models with zero thinking delay (measured <350ms)
-        private const val MODEL_PRIMARY = "gemini-3.1-flash-lite"
-        private const val MODEL_FALLBACK_1 = "gemini-3.5-flash-lite"
-        private const val MODEL_FALLBACK_2 = "gemini-3.8-flash"
+        private const val MODEL_PRIMARY = "gemini-3.1-flash-lite-preview"
+        private const val MODEL_FALLBACK_1 = "gemini-3.5-flash"
+        private const val MODEL_FALLBACK_2 = "gemini-2.5-flash"
 
-        // Gemini Native Voice TTS models in priority order (measured <650ms for raw audio/wav)
+        // Gemini Native Voice TTS models in priority order
         private val VOICE_MODELS = listOf(
-            "gemini-3.8-flash-lite-tts",
-            "gemini-3.8-flash-tts",
-            "gemini-3.1-flash-tts-preview"
+            "gemini-2.5-flash-preview-tts",
+            "gemini-2.5-flash"
         )
 
         private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -715,14 +714,24 @@ class GeminiVoiceService {
             }
         }
 
-        // Dedicated Gemini Native Voice TTS (gemini-3.8-flash-tts)
-        // Accepts pure text content directly and outputs audio/wav without unsupported speechConfig
         val ttsRequestJson = JSONObject().apply {
             put("contents", JSONArray().apply {
                 put(JSONObject().apply {
                     put("parts", JSONArray().apply {
                         put(JSONObject().apply {
                             put("text", cleanText)
+                        })
+                    })
+                })
+            })
+            put("generationConfig", JSONObject().apply {
+                put("responseModalities", JSONArray().apply {
+                    put("AUDIO")
+                })
+                put("speechConfig", JSONObject().apply {
+                    put("voiceConfig", JSONObject().apply {
+                        put("prebuiltVoiceConfig", JSONObject().apply {
+                            put("voiceName", voiceName)
                         })
                     })
                 })

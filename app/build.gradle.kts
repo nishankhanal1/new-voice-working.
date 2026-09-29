@@ -22,6 +22,7 @@ android {
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     val envGeminiKey = System.getenv("GEMINI_API_KEY") ?: ""
+    buildConfigField("String", "GEMINI_API_KEY", "\"$envGeminiKey\"")
     buildConfigField("String", "INJECTED_GEMINI_API_KEY", "\"$envGeminiKey\"")
   }
 
@@ -71,6 +72,7 @@ secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+  ignoreList.add("GEMINI_API_KEY")
 }
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }

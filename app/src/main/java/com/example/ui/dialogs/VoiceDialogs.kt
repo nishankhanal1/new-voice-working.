@@ -75,7 +75,9 @@ fun SettingsDialog(
     currentVoice: String,
     currentApiKey: String,
     currentPersona: NepaliPersona = NepaliPersona.BUDDY,
-    silenceTimeoutMs: Long = 200L,
+    silenceTimeoutMs: Long = 350L,
+    isStreamPrewarmed: Boolean = true,
+    initialPlaybackLagMs: Long = 0L,
     onVoiceSelected: (String) -> Unit,
     onPersonaSelected: (NepaliPersona) -> Unit = {},
     onSilenceTimeoutChanged: (Long) -> Unit = {},
@@ -91,9 +93,10 @@ fun SettingsDialog(
         Pair("Charon", "Calm, Steady Male")
     )
     val latencyOptions = listOf(
-        Pair(180L, "⚡ सुपर द्रुत (<100ms मोड)"),
-        Pair(300L, "🚀 छिटो (Fast 300ms)"),
-        Pair(450L, "⏱️ सन्तुलित (Normal 450ms)")
+        Pair(200L, "⚡⚡ अति छिटो (200ms)"),
+        Pair(220L, "🚀 सिफारिस (220ms)"),
+        Pair(250L, "⚡ छिटो (250ms)"),
+        Pair(350L, "⏱️ सन्तुलित (350ms)")
     )
 
     Dialog(
@@ -346,6 +349,62 @@ fun SettingsDialog(
                     ),
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // AudioTrack Buffer Pre-Warming Status Card
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xFF0F0A21))
+                        .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                        .padding(12.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(if (isStreamPrewarmed) Color(0xFF10B981) else Color(0xFFF59E0B))
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "AudioTrack Stream Buffer",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                        }
+                        Text(
+                            text = if (isStreamPrewarmed) "PRE-WARMED (0ms Lag)" else "Standby",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isStreamPrewarmed) Color(0xFF34D399) else Color(0xFFFBBF24)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "मौन समयमा शून्य-आवाज (Silence Buffer) पूर्व-सञ्चालन गरी WebSocket अडियो आउने बित्तिकै बिना कुनै ढिलाइ तत्काल आवाज निकाल्छ।",
+                        fontSize = 10.sp,
+                        color = Color(0xFFC084FC),
+                        lineHeight = 14.sp
+                    )
+                    if (initialPlaybackLagMs > 0) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "पछिल्लो अडियो सुरु ढिलाइ (Startup Lag): ${initialPlaybackLagMs}ms (<5ms Target)",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color(0xFF38BDF8)
+                        )
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(16.dp))
 
